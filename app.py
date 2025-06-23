@@ -247,7 +247,7 @@ class EnhancedLawFileExtractor:
         # 각 카테고리를 제거
         for category in categories:
             # 독립된 라인에 있는 카테고리 제거
-            text = re.sub(rf'^\s*{category}\s*
+            text = re.sub(rf'^\s*{category}\s*$', '', text, flags=re.MULTILINE)
     
     def _extract_laws_from_pdf_structure(self, text: str) -> Set[str]:
         """PDF 구조를 고려한 법령명 추출"""
