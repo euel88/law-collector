@@ -44,6 +44,10 @@ if 'collected_laws' not in st.session_state:
     st.session_state.collected_laws = {}
 if 'file_processed' not in st.session_state:
     st.session_state.file_processed = False
+if 'openai_api_key' not in st.session_state:
+    st.session_state.openai_api_key = None
+if 'use_ai' not in st.session_state:
+    st.session_state.use_ai = False
 
 
 class EnhancedLawFileExtractor:
@@ -90,6 +94,10 @@ class EnhancedLawFileExtractor:
             r'^([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?(?:고시|훈령|예규|지침))(?:\s|$)',
         ]
         
+        # AI 설정 확인
+        self.use_ai = st.session_state.get('use_ai', False)
+        self.api_key = st.session_state.get('openai_api_key', None)
+        
     def extract_from_pdf(self, file) -> List[str]:
         """PDF 파일에서 법령명 추출 - 개선된 버전"""
         all_text = ""
@@ -117,10 +125,74 @@ class EnhancedLawFileExtractor:
         laws = self._extract_laws_from_pdf_structure(all_text)
         
         # AI 기반 추출이 설정되어 있으면 사용
-        if hasattr(self, 'use_ai') and self.use_ai:
+        if self.use_ai and self.api_key:
             laws = self._enhance_with_ai(all_text, laws)
         
         return sorted(list(laws))
+    
+    def _enhance_with_ai(self, text: str, initial_laws: Set[str]) -> Set[str]:
+        """ChatGPT API를 활용한 법령명 추출 개선"""
+        try:
+            import openai
+            openai.api_key = self.api_key
+            
+            # 텍스트 샘플 (토큰 제한을 위해 2000자로 제한)
+            sample_text = text[:2000]
+            
+            prompt = f"""다음은 법령 관련 PDF에서 추출한 텍스트입니다.
+이 텍스트에서 실제 법령명만 정확히 추출해주세요.
+
+중요한 규칙:
+1. "상하위법", "행정규칙", "관련법령" 같은 카테고리는 제외하세요
+2. 법령명은 완전한 형태로 추출하세요 (예: "금융기관 검사 및 제재에 관한 규정")
+3. 시행령, 시행규칙은 기본 법률과 별도로 구분하세요
+4. 중복은 제거하세요
+5. 시행 날짜 정보는 제외하세요
+
+텍스트:
+{sample_text}
+
+현재 추출된 법령명:
+{', '.join(list(initial_laws)[:10])}
+
+정확한 법령명을 한 줄에 하나씩 출력하세요:"""
+            
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "당신은 한국 법령 전문가입니다. 법령명을 정확히 식별하고 추출하는 전문가입니다."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=800
+            )
+            
+            # AI 응답 파싱
+            ai_laws = set()
+            ai_response = response.choices[0].message.content.strip()
+            
+            for line in ai_response.split('\n'):
+                line = line.strip()
+                
+                # 번호나 기호 제거
+                line = re.sub(r'^[\d\-\.\*\•]+\s*', '', line)
+                
+                if line and self._is_valid_law_name(line):
+                    ai_laws.add(line)
+            
+            # 기존 결과와 AI 결과 병합
+            if ai_laws:
+                st.info(f"🤖 AI가 {len(ai_laws)}개의 법령명을 추가로 발견했습니다")
+                return initial_laws.union(ai_laws)
+            else:
+                return initial_laws
+                
+        except ImportError:
+            st.warning("⚠️ OpenAI 라이브러리가 설치되지 않았습니다. 터미널에서 'pip install openai' 명령을 실행해주세요.")
+            return initial_laws
+        except Exception as e:
+            st.warning(f"⚠️ AI 추출 중 오류: {str(e)}")
+            return initial_laws
     
     def _extract_laws_from_text(self, text: str) -> Set[str]:
         """텍스트에서 법령명 추출 - 개선된 버전"""
@@ -1036,6 +1108,43 @@ def main():
             placeholder="이메일 @ 앞부분",
             help="예: test@korea.kr → test"
         )
+        
+        st.divider()
+        
+        # AI 설정 섹션 추가
+        with st.expander("🤖 AI 설정 (선택사항)", expanded=False):
+            st.markdown("**ChatGPT를 사용하여 법령명 추출 정확도를 높입니다**")
+            
+            api_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+                value=st.session_state.get('openai_api_key', ''),
+                help="OpenAI API 키를 입력하세요. https://platform.openai.com/api-keys 에서 발급 가능합니다."
+            )
+            
+            if api_key:
+                st.session_state.openai_api_key = api_key
+                st.session_state.use_ai = True
+                st.success("✅ API 키가 설정되었습니다!")
+                
+                # API 키 테스트 버튼
+                if st.button("🔍 API 키 테스트", type="secondary"):
+                    try:
+                        import openai
+                        openai.api_key = api_key
+                        
+                        # 간단한 테스트 요청
+                        response = openai.ChatCompletion.create(
+                            model="gpt-3.5-turbo",
+                            messages=[{"role": "user", "content": "안녕하세요"}],
+                            max_tokens=10
+                        )
+                        st.success("✅ API 키가 정상적으로 작동합니다!")
+                    except Exception as e:
+                        st.error(f"❌ API 키 오류: {str(e)}")
+            else:
+                st.session_state.use_ai = False
+                st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
         
         st.divider()
         
