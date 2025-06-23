@@ -1,6 +1,7 @@
 """
 법제처 법령 수집기 - Streamlit 버전
 GitHub/Streamlit Cloud에서 실행 가능한 웹 애플리케이션
+lxml 의존성 제거 버전
 """
 
 import streamlit as st
@@ -126,6 +127,7 @@ class LawCollectorStreamlit:
                 st.warning(f"{law_name} 상세 정보 접근 실패")
                 return self._get_basic_info(law_id, law_name)
             
+            # html.parser 사용 (lxml 대신)
             soup = BeautifulSoup(response.text, 'html.parser')
             
             law_detail = {
@@ -177,6 +179,7 @@ class LawCollectorStreamlit:
                                 'User-Agent': 'Mozilla/5.0'
                             }
                         )
+                        # html.parser 사용
                         iframe_soup = BeautifulSoup(iframe_response.text, 'html.parser')
                         
                         # iframe 내용에서 조문 추출
@@ -252,6 +255,7 @@ class LawCollectorStreamlit:
             )
             
             if response.status_code == 200:
+                # html.parser 사용
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
                 # 법령 체계 정보 추출
