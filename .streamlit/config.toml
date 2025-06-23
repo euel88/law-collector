@@ -8,6 +8,13 @@ font = "sans serif"
 [server]
 headless = true
 port = 8501
+maxUploadSize = 200  # 파일 업로드 크기 제한
 
 [browser]
 gatherUsageStats = false
+
+[runner]
+magicEnabled = false  # 약간의 성능 향상
+
+[client]
+caching = true  # 브라우저 캐싱 활성화v
