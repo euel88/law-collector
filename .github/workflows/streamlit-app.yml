@@ -1,0 +1,54 @@
+name: Streamlit App CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Run tests with secrets
+      env:
+        OC_CODE: ${{ secrets.OC_CODE }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      run: |
+        # 테스트 실행 (예시)
+        python -m pytest tests/
+    
+    - name: Check code quality
+      run: |
+        # 코드 품질 검사 (선택사항)
+        pip install flake8
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to Streamlit Cloud
+      env:
+        STREAMLIT_API_TOKEN: ${{ secrets.STREAMLIT_API_TOKEN }}
+      run: |
+        # Streamlit Cloud API를 사용한 배포 (예시)
+        echo "Deploying to Streamlit Cloud..."
+        # 실제 배포 명령어는 Streamlit Cloud 설정에 따라 다름
