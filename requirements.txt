@@ -1,7 +1,26 @@
-streamlit
-requests
-pandas
-openpyxl
-PyPDF2
-pdfplumber
-openai>=0.27.0
+# Streamlit 웹 프레임워크
+streamlit==1.46.0
+
+# HTTP 요청 처리
+requests==2.32.4
+urllib3==2.5.0
+
+# XML 처리 (내장 라이브러리 사용)
+
+# PDF 처리
+PyPDF2==3.0.1
+pdfplumber==0.11.7
+
+# Excel 처리
+pandas==2.3.0
+openpyxl==3.1.5
+
+# ZIP 파일 처리 (내장 라이브러리 사용)
+
+# 날짜 처리 (내장 라이브러리 사용)
+
+# OpenAI API (선택사항 - AI 기능 사용 시)
+# openai==1.90.0
+
+# 기타 유틸리티
+python-dateutil==2.9.0.post0
