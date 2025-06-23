@@ -1,13 +1,24 @@
-# Testing
+# Testing framework
 pytest==7.4.3
 pytest-cov==4.1.0
 pytest-asyncio==0.21.1
+pytest-mock==3.12.0
 
-# Code quality
+# Code quality tools
 flake8==6.1.0
 black==23.12.1
 mypy==1.7.1
+isort==5.13.2
+
+# Type stubs
+types-requests==2.31.0.10
+types-pytz==2023.3.1.1
 
 # Development utilities
 ipython==8.18.1
+ipdb==0.13.13
 pre-commit==3.6.0
+
+# Documentation
+sphinx==7.2.6
+sphinx-rtd-theme==2.0.0
