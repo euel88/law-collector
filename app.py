@@ -1,7 +1,7 @@
 """
 법제처 법령 수집기 - Streamlit 버전
 GitHub/Streamlit Cloud에서 실행 가능한 웹 애플리케이션
-lxml 의존성 제거 버전
+pandas 의존성 완전 제거 버전 (Python 3.13 호환)
 """
 
 import streamlit as st
@@ -10,8 +10,6 @@ import xml.etree.ElementTree as ET
 import json
 import time
 import re
-# pandas 제거 - Python 3.13 호환성 문제
-# import pandas as pd
 from datetime import datetime
 from bs4 import BeautifulSoup
 import urllib3
@@ -38,6 +36,8 @@ if 'collected_precs' not in st.session_state:
     st.session_state.collected_precs = []
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
+if 'selected_laws' not in st.session_state:
+    st.session_state.selected_laws = []
 
 class LawCollectorStreamlit:
     """Streamlit용 법령 수집기"""
@@ -411,37 +411,56 @@ def main():
                     st.warning("검색 결과가 없습니다.")
                     st.session_state.search_results = []
     
-    # 검색 결과 표시
+    # 검색 결과 표시 (pandas 없이)
     if st.session_state.search_results:
         st.subheader("🔎 검색 결과")
         
-        # 테이블 직접 생성 (pandas 대신)
-        st.write("수집할 법령을 선택하세요 (체크박스 클릭):")
+        # 테이블 헤더
+        col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+        with col1:
+            st.markdown("**선택**")
+        with col2:
+            st.markdown("**법령명**")
+        with col3:
+            st.markdown("**법종구분**")
+        with col4:
+            st.markdown("**시행일자**")
         
+        st.divider()
+        
+        # 선택된 법령 추적
         selected_indices = []
+        
+        # 각 법령에 대한 체크박스와 정보 표시
         for i, law in enumerate(st.session_state.search_results):
             col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+            
             with col1:
                 if st.checkbox("", key=f"select_{i}"):
                     selected_indices.append(i)
+            
             with col2:
                 st.write(law['law_name'])
+            
             with col3:
                 st.write(law['law_type'])
+            
             with col4:
                 st.write(law['enforcement_date'])
         
-        # 선택된 법령 목록
-        selected_laws = [st.session_state.search_results[i] for i in selected_indices]
+        # 선택된 법령 저장
+        st.session_state.selected_laws = [
+            st.session_state.search_results[i] for i in selected_indices
+        ]
         
-        if selected_laws:
-            st.info(f"{len(selected_laws)}개 법령이 선택되었습니다.")
+        if st.session_state.selected_laws:
+            st.info(f"{len(st.session_state.selected_laws)}개 법령이 선택되었습니다.")
     
     # 수집 실행
     if collect_btn:
         if not oc_code:
             st.error("기관코드를 입력해주세요!")
-        elif not selected_laws:
+        elif not st.session_state.selected_laws:
             st.error("수집할 법령을 선택해주세요!")
         else:
             # 진행 상황 표시
@@ -453,14 +472,14 @@ def main():
             st.session_state.collected_hierarchy = {}
             st.session_state.collected_precs = []
             
-            total_steps = len(selected_laws)
+            total_steps = len(st.session_state.selected_laws)
             if include_hierarchy:
-                total_steps += len(selected_laws)
+                total_steps += len(st.session_state.selected_laws)
             
             current_step = 0
             
             # 법령 수집
-            for law in selected_laws:
+            for law in st.session_state.selected_laws:
                 current_step += 1
                 progress = current_step / total_steps
                 progress_bar.progress(progress)
