@@ -1,6 +1,8 @@
 """
-법제처 법령 수집기 - 최종 통합 버전
-직접 검색 + 파일 업로드 + 개선된 법령명 추출
+법제처 법령 수집기 - 완전 수정 버전 (v2.0)
+- Checkbox 접근성 경고 해결
+- 법령 검색 매칭 로직 개선
+- 검색 성공률 극대화
 """
 
 import streamlit as st
@@ -484,7 +486,7 @@ class LawCollectorAPI:
         self.delay = 0.5  # API 호출 간격
         
     def search_law(self, oc_code: str, law_name: str) -> List[Dict[str, Any]]:
-        """법령 검색"""
+        """법령 검색 - 개선된 버전"""
         params = {
             'OC': oc_code,
             'target': 'law',
@@ -501,20 +503,41 @@ class LawCollectorAPI:
                 timeout=10,
                 verify=False
             )
-            response.encoding = 'utf-8'
             
+            # 디버깅을 위한 로그
             if response.status_code != 200:
+                st.warning(f"API 응답 코드: {response.status_code}")
                 return []
             
+            # 인코딩 명시적 설정
+            response.encoding = 'utf-8'
             content = response.text
             
             # BOM 제거
             if content.startswith('\ufeff'):
                 content = content[1:]
             
-            # XML 파싱
-            root = ET.fromstring(content.encode('utf-8'))
+            # XML 파싱 시도
+            try:
+                # XML 선언이 없으면 추가
+                if not content.strip().startswith('<?xml'):
+                    content = '<?xml version="1.0" encoding="UTF-8"?>\n' + content
+                
+                # 잘못된 문자 제거
+                content = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', content)
+                
+                root = ET.fromstring(content.encode('utf-8'))
+            except ET.ParseError as e:
+                st.error(f"XML 파싱 오류: {str(e)[:100]}")
+                # HTML 응답인 경우 처리
+                if '<html>' in content.lower():
+                    st.error("API가 HTML을 반환했습니다. 기관코드를 확인해주세요.")
+                return []
+            
             laws = []
+            
+            # totalCount 확인 (디버깅용)
+            total_count = root.findtext('.//totalCnt', '0')
             
             for law_elem in root.findall('.//law'):
                 law_id = law_elem.findtext('법령ID', '')
@@ -534,8 +557,14 @@ class LawCollectorAPI:
             
             return laws
             
+        except requests.exceptions.Timeout:
+            st.error("API 요청 시간 초과 - 나중에 다시 시도해주세요")
+            return []
+        except requests.exceptions.ConnectionError:
+            st.error("네트워크 연결 오류 - 인터넷 연결을 확인해주세요")
+            return []
         except Exception as e:
-            st.error(f"검색 오류: {str(e)}")
+            st.error(f"검색 중 오류 발생: {str(e)}")
             return []
     
     def get_law_detail_with_full_content(self, oc_code: str, law_id: str, law_msn: str, law_name: str) -> Optional[Dict[str, Any]]:
@@ -1092,6 +1121,122 @@ class LawCollectorAPI:
         return content
 
 
+# 법령명 검색 변형 생성 함수 추가
+def generate_search_variations(law_name: str) -> List[str]:
+    """법령명의 다양한 변형 생성 - 검색 성공률 향상"""
+    variations = [law_name]  # 원본
+    
+    # 1. 띄어쓰기 추가 버전
+    # "금융기관검사및제재에관한규정" → "금융기관 검사 및 제재에 관한 규정"
+    spaced = law_name
+    spaced = re.sub(r'([가-힣]+)및([가-힣]+)', r'\1 및 \2', spaced)
+    spaced = re.sub(r'([가-힣]+)에관한([가-힣]+)', r'\1에 관한 \2', spaced)
+    spaced = re.sub(r'([가-힣]+)에관한', r'\1에 관한 ', spaced)
+    if spaced != law_name:
+        variations.append(spaced)
+    
+    # 2. 띄어쓰기 제거 버전
+    no_space = law_name.replace(' ', '')
+    if no_space != law_name:
+        variations.append(no_space)
+    
+    # 3. "에관한" → "에 관한" 변환
+    if '에관한' in law_name:
+        variations.append(law_name.replace('에관한', '에 관한'))
+    
+    # 4. "에 관한" → "에관한" 변환
+    if '에 관한' in law_name:
+        variations.append(law_name.replace('에 관한', '에관한'))
+    
+    # 5. 시행령/시행규칙 분리 검색
+    if ' 시행령' in law_name:
+        base = law_name.replace(' 시행령', '')
+        variations.append(base)
+        variations.append(f"{base}시행령")
+    
+    if ' 시행규칙' in law_name:
+        base = law_name.replace(' 시행규칙', '')
+        variations.append(base)
+        variations.append(f"{base}시행규칙")
+    
+    # 6. 괄호 제거
+    if '(' in law_name or ')' in law_name:
+        no_paren = re.sub(r'[()]', '', law_name).strip()
+        variations.append(no_paren)
+    
+    # 7. 주요 키워드만 추출 (마지막 수단)
+    # "금융기관 검사 및 제재에 관한 규정" → "금융기관"
+    words = law_name.split()
+    if len(words) > 3:
+        # 첫 2개 단어만
+        variations.append(' '.join(words[:2]))
+        # 마지막 법령 타입 제외
+        if words[-1] in ['법', '령', '규칙', '규정', '세칙']:
+            variations.append(' '.join(words[:-1]))
+    
+    # 중복 제거하고 반환
+    return list(dict.fromkeys(variations))
+
+
+def is_matching_law(query: str, result_name: str) -> bool:
+    """유연한 법령명 매칭"""
+    # 정규화: 공백, 특수문자 제거
+    def normalize(text):
+        # 모든 공백 제거
+        text = re.sub(r'\s+', '', text)
+        # 특수문자 제거
+        text = re.sub(r'[^\w가-힣]', '', text)
+        return text.lower()
+    
+    query_norm = normalize(query)
+    result_norm = normalize(result_name)
+    
+    # 1. 정규화된 텍스트로 완전 일치
+    if query_norm == result_norm:
+        return True
+    
+    # 2. 포함 관계 (80% 이상)
+    if len(query_norm) > 0:
+        if query_norm in result_norm:
+            return True
+        if result_norm in query_norm:
+            return True
+    
+    # 3. 주요 키워드 매칭
+    # 법령 타입 추출
+    law_types = ['법률', '법', '시행령', '시행규칙', '규정', '규칙', '세칙', '고시', '훈령', '예규']
+    
+    query_type = None
+    result_type = None
+    
+    for ltype in law_types:
+        if ltype in query:
+            query_type = ltype
+        if ltype in result_name:
+            result_type = ltype
+    
+    # 같은 타입의 법령인지 확인
+    if query_type and result_type and query_type == result_type:
+        # 법령명의 핵심 부분 비교
+        query_core = query.replace(query_type, '').strip()
+        result_core = result_name.replace(result_type, '').strip()
+        
+        # 핵심 부분이 유사한지 확인
+        if normalize(query_core) in normalize(result_core) or normalize(result_core) in normalize(query_core):
+            return True
+    
+    # 4. 레벤슈타인 거리 기반 유사도 (선택적 - 더 정교한 매칭)
+    # 여기서는 간단한 방법으로 대체
+    # 공통 문자 비율이 70% 이상이면 매칭
+    common_chars = set(query_norm) & set(result_norm)
+    if len(query_norm) > 0:
+        similarity = len(common_chars) / len(set(query_norm))
+        if similarity >= 0.7:
+            return True
+    
+    return False
+
+
 # 메인 UI
 def main():
     st.title("📚 법제처 법령 수집기")
@@ -1284,7 +1429,7 @@ def main():
                 st.session_state.extracted_laws.append(new_law)
                 st.rerun()
             
-            # 법령 검색 버튼
+            # 법령 검색 버튼 - 개선된 검색 로직 적용
             if st.button("🔍 법령 검색", type="primary", use_container_width=True):
                 if not oc_code:
                     st.error("기관코드를 입력해주세요!")
@@ -1299,31 +1444,53 @@ def main():
                         st.session_state.extracted_laws = edited_laws
                     
                     total = len(st.session_state.extracted_laws)
+                    no_result_laws = []  # 검색 실패한 법령 추적
                     
                     for idx, law_name in enumerate(st.session_state.extracted_laws):
                         progress = (idx + 1) / total
                         progress_bar.progress(progress)
                         status_text.text(f"검색 중: {law_name}")
                         
-                        # API 검색
-                        results = collector.search_law(oc_code, law_name)
+                        # 다양한 형식으로 검색 시도
+                        search_variations_list = generate_search_variations(law_name)
+                        found = False
                         
-                        for result in results:
-                            # 검색어와 유사한 결과만 포함
-                            if law_name in result['law_name'] or result['law_name'] in law_name:
-                                result['search_query'] = law_name
-                                search_results.append(result)
+                        for variation in search_variations_list:
+                            results = collector.search_law(oc_code, variation)
+                            
+                            if results:
+                                # 유연한 매칭으로 결과 필터링
+                                for result in results:
+                                    if is_matching_law(law_name, result['law_name']):
+                                        result['search_query'] = law_name
+                                        search_results.append(result)
+                                        found = True
+                                        break
+                                
+                                if found:
+                                    break
+                        
+                        if not found:
+                            no_result_laws.append(law_name)
                         
                         time.sleep(collector.delay)
                     
                     progress_bar.progress(1.0)
                     status_text.text("검색 완료!")
                     
+                    # 결과 표시
                     if search_results:
                         st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
                         st.session_state.search_results = search_results
                     else:
                         st.warning("검색 결과가 없습니다")
+                    
+                    # 검색 실패한 법령 목록 표시
+                    if no_result_laws:
+                        with st.expander(f"❌ 검색되지 않은 법령 ({len(no_result_laws)}개)"):
+                            for law in no_result_laws:
+                                st.write(f"- {law}")
+                            st.info("💡 Tip: 기관코드를 확인하거나, 법령명을 수정해보세요.")
         
         # 검색 결과 표시
         if st.session_state.search_results:
@@ -1366,7 +1533,12 @@ def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str,
             col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
         
         with col1:
-            is_selected = st.checkbox("", key=f"sel_{idx}", value=select_all)
+            is_selected = st.checkbox(
+                "선택", 
+                key=f"sel_{idx}", 
+                value=select_all,
+                label_visibility="collapsed"
+            )
             if is_selected:
                 selected_indices.append(idx)
         
