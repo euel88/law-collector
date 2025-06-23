@@ -1,21 +1,7 @@
-# Core framework
-streamlit==1.29.0
-
-# HTTP & Network
-requests==2.31.0
-urllib3==2.1.0
-
-# Data processing
-pandas==2.1.4
-openpyxl==3.1.2
-
-# PDF processing
-PyPDF2==3.0.1
-pdfplumber==0.10.3
-
-# AI integration (optional)
-openai==1.6.1
-
-# Additional utilities
-python-dateutil==2.8.2
-pytz==2023.3.post1
+streamlit
+requests
+pandas
+openpyxl
+PyPDF2
+pdfplumber
+openai>=0.27.0
