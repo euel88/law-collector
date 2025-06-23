@@ -153,7 +153,7 @@ class EnhancedLawFileExtractor:
 3. "에관한" → "에 관한"으로 통일
 4. 시행령, 시행규칙은 기본 법률명과 함께 완전한 형태로 표기
 5. 중복 제거하고 고유한 법령명만 출력
-6. 시행 날짜 정보([시행 YYYY.MM.DD.])는 제외
+6. 시행 날짜 정보([시행 2024.MM.DD.])는 제외
 
 텍스트:
 {sample_text}
@@ -502,82 +502,87 @@ class LawCollectorAPI:
         self.delay = 0.5  # API 호출 간격
         
     def search_law(self, oc_code: str, law_name: str) -> List[Dict[str, Any]]:
-        """법령 검색 - 개선된 버전"""
-        params = {
-            'OC': oc_code,
-            'target': 'law',
-            'type': 'XML',
-            'query': law_name,
-            'display': '100',
-            'page': '1'
-        }
-        
-        try:
-            response = requests.get(
-                self.law_search_url, 
-                params=params, 
-                timeout=10,
-                verify=False
-            )
-            
-            if response.status_code != 200:
-                st.warning(f"API 응답 코드: {response.status_code}")
-                return []
-            
-            response.encoding = 'utf-8'
-            content = response.text
-            
-            if content.startswith('\ufeff'):
-                content = content[1:]
+        """법령 검색 - 법령과 행정규칙 모두 검색하도록 개선"""
+        all_results = {}  # 중복 제거를 위한 딕셔너리 (key: 법령ID)
+        search_targets = ['law', 'admrul']  # 'law': 법령, 'admrul': 행정규칙
+
+        for target in search_targets:
+            params = {
+                'OC': oc_code,
+                'target': target,
+                'type': 'XML',
+                'query': law_name,
+                'display': '100',
+                'page': '1'
+            }
             
             try:
-                if not content.strip().startswith('<?xml'):
-                    content = '<?xml version="1.0" encoding="UTF-8"?>\n' + content
+                response = requests.get(
+                    self.law_search_url, 
+                    params=params, 
+                    timeout=10,
+                    verify=False
+                )
                 
-                content = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', content)
+                if response.status_code != 200:
+                    # API 에러 시 다음 타겟으로 넘어감
+                    continue
                 
-                root = ET.fromstring(content.encode('utf-8'))
-            except ET.ParseError as e:
-                st.error(f"XML 파싱 오류: {str(e)[:100]}")
-                if '<html>' in content.lower():
-                    st.error("API가 HTML을 반환했습니다. 기관코드를 확인해주세요.")
-                return []
-            
-            laws = []
-            
-            for law_elem in root.findall('.//law'):
-                law_id = law_elem.findtext('법령ID', '')
-                law_name_full = law_elem.findtext('법령명한글', '')
-                law_msn = law_elem.findtext('법령일련번호', '')
+                response.encoding = 'utf-8'
+                content = response.text
                 
-                if law_id and law_name_full:
-                    law_info = {
-                        'law_id': law_id,
-                        'law_msn': law_msn,
-                        'law_name': law_name_full,
-                        'law_type': law_elem.findtext('법종구분', ''),
-                        'promulgation_date': law_elem.findtext('공포일자', ''),
-                        'enforcement_date': law_elem.findtext('시행일자', ''),
-                    }
-                    laws.append(law_info)
+                if content.startswith('\ufeff'):
+                    content = content[1:]
+                
+                # 비어있는 응답이나 에러 메시지가 있는 경우 건너뜀
+                if not content.strip() or "SERVICE ERROR" in content or "APPLICATION ERROR" in content:
+                    continue
+
+                try:
+                    if not content.strip().startswith('<?xml'):
+                        content = '<?xml version="1.0" encoding="UTF-8"?>\n' + content
+                    
+                    content = re.sub(r'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]', '', content)
+                    
+                    root = ET.fromstring(content.encode('utf-8'))
+                except ET.ParseError:
+                    # XML 파싱 오류 시 다음 타겟으로 넘어감
+                    continue
+
+                for law_elem in root.findall('.//law'):
+                    law_id = law_elem.findtext('법령ID', '')
+                    law_name_full = law_elem.findtext('법령명한글', '')
+                    
+                    # 법령ID 기준으로 중복 추가 방지
+                    if law_id and law_name_full and law_id not in all_results:
+                        law_info = {
+                            'law_id': law_id,
+                            'law_msn': law_elem.findtext('법령일련번호', ''),
+                            'law_name': law_name_full,
+                            'law_type': law_elem.findtext('법종구분', ''),
+                            'promulgation_date': law_elem.findtext('공포일자', ''),
+                            'enforcement_date': law_elem.findtext('시행일자', ''),
+                        }
+                        all_results[law_id] = law_info
             
-            return laws
-            
-        except requests.exceptions.Timeout:
-            st.error("API 요청 시간 초과 - 나중에 다시 시도해주세요")
-            return []
-        except requests.exceptions.ConnectionError:
-            st.error("네트워크 연결 오류 - 인터넷 연결을 확인해주세요")
-            return []
-        except Exception as e:
-            st.error(f"검색 중 오류 발생: {str(e)}")
-            return []
-    
-    def get_law_detail_with_full_content(self, oc_code: str, law_id: str, law_msn: str, law_name: str) -> Optional[Dict[str, Any]]:
+            except requests.exceptions.RequestException:
+                # 네트워크 관련 예외 발생 시 다음 타겟으로 진행
+                continue
+            except Exception:
+                # 기타 예외 발생 시 다음 타겟으로 진행
+                continue
+
+        return list(all_results.values())
+
+    def get_law_detail_with_full_content(self, oc_code: str, law_id: str, law_msn: str, law_name: str, law_type: str) -> Optional[Dict[str, Any]]:
         """법령 상세 정보 수집 - 조문, 부칙, 별표 모두 포함"""
+        
+        # 법종구분에 따라 target을 동적으로 설정
+        target_service = 'admrul' if law_type in ['훈령', '예규', '고시', '지침', '공고'] else 'law'
+
         params = {
             'OC': oc_code,
-            'target': 'law',
+            'target': target_service,
             'type': 'XML',
             'MST': law_msn,
             'mobileYn': 'N'
@@ -593,9 +598,19 @@ class LawCollectorAPI:
             response.encoding = 'utf-8'
             
             if response.status_code != 200:
-                st.warning(f"{law_name} 상세 정보 접근 실패")
-                return None
-            
+                # 1차 실패시 다른 target으로 한번 더 시도
+                params['target'] = 'law' if target_service == 'admrul' else 'admrul'
+                response = requests.get(
+                    self.law_detail_url,
+                    params=params,
+                    timeout=30,
+                    verify=False
+                )
+                response.encoding = 'utf-8'
+                if response.status_code != 200:
+                    st.warning(f"{law_name} 상세 정보 접근 실패")
+                    return None
+
             content = response.text
             
             if content.startswith('\ufeff'):
@@ -1068,7 +1083,7 @@ class LawCollectorAPI:
 
 def generate_search_variations(law_name: str) -> List[str]:
     """법령명의 다양한 변형 생성 - 검색 성공률 향상"""
-    variations = [law_name]
+    variations = {law_name}
     
     # 띄어쓰기 추가 버전
     spaced = law_name
@@ -1076,49 +1091,58 @@ def generate_search_variations(law_name: str) -> List[str]:
     spaced = re.sub(r'([가-힣]+)에관한([가-힣]+)', r'\1에 관한 \2', spaced)
     spaced = re.sub(r'([가-힣]+)에관한', r'\1에 관한 ', spaced)
     if spaced != law_name:
-        variations.append(spaced)
+        variations.add(spaced)
     
     # 띄어쓰기 제거 버전
     no_space = law_name.replace(' ', '')
     if no_space != law_name:
-        variations.append(no_space)
+        variations.add(no_space)
     
     # "에관한" ↔ "에 관한" 변환
     if '에관한' in law_name:
-        variations.append(law_name.replace('에관한', '에 관한'))
+        variations.add(law_name.replace('에관한', '에 관한'))
     if '에 관한' in law_name:
-        variations.append(law_name.replace('에 관한', '에관한'))
+        variations.add(law_name.replace('에 관한', '에관한'))
     
     # 시행령/시행규칙 분리
     if ' 시행령' in law_name:
         base = law_name.replace(' 시행령', '')
-        variations.append(base)
-        variations.append(f"{base}시행령")
+        variations.add(base)
+        variations.add(f"{base}시행령")
     
     if ' 시행규칙' in law_name:
         base = law_name.replace(' 시행규칙', '')
-        variations.append(base)
-        variations.append(f"{base}시행규칙")
+        variations.add(base)
+        variations.add(f"{base}시행규칙")
+
+    if ' 시행세칙' in law_name:
+        base = law_name.replace(' 시행세칙', '')
+        variations.add(base)
+        variations.add(f"{base}시행세칙")
     
     # 괄호 제거
     if '(' in law_name or ')' in law_name:
-        no_paren = re.sub(r'[()]', '', law_name).strip()
-        variations.append(no_paren)
+        no_paren = re.sub(r'\(.*?\)', '', law_name).strip()
+        variations.add(no_paren)
     
     # 주요 키워드만
     words = law_name.split()
     if len(words) > 3:
-        variations.append(' '.join(words[:2]))
-        if words[-1] in ['법', '령', '규칙', '규정', '세칙']:
-            variations.append(' '.join(words[:-1]))
+        variations.add(' '.join(words[:2]))
+        if words[-1] in ['법', '령', '규칙', '규정', '세칙', '고시', '훈령', '예규']:
+            variations.add(' '.join(words[:-1]))
     
-    return list(dict.fromkeys(variations))
+    return list(variations)
 
 
 def is_matching_law(query: str, result_name: str) -> bool:
     """유연한 법령명 매칭"""
     def normalize(text):
+        # 괄호와 그 안의 내용 제거
+        text = re.sub(r'\(.*?\)', '', text)
+        # 공백 제거
         text = re.sub(r'\s+', '', text)
+        # 특수문자 제거
         text = re.sub(r'[^\w가-힣]', '', text)
         return text.lower()
     
@@ -1129,35 +1153,26 @@ def is_matching_law(query: str, result_name: str) -> bool:
     if query_norm == result_norm:
         return True
     
-    # 포함 관계
-    if query_norm in result_norm or result_norm in query_norm:
-        return True
-    
-    # 주요 키워드 매칭
-    law_types = ['법률', '법', '시행령', '시행규칙', '규정', '규칙', '세칙', '고시', '훈령', '예규']
-    
-    query_type = None
-    result_type = None
-    
-    for ltype in law_types:
-        if ltype in query:
-            query_type = ltype
-        if ltype in result_name:
-            result_type = ltype
-    
-    if query_type and result_type and query_type == result_type:
-        query_core = query.replace(query_type, '').strip()
-        result_core = result_name.replace(result_type, '').strip()
-        
-        if normalize(query_core) in normalize(result_core) or normalize(result_core) in normalize(query_core):
+    # 포함 관계 (더 긴 쪽이 짧은 쪽을 포함)
+    if len(query_norm) > len(result_norm):
+        if result_norm in query_norm:
             return True
-    
-    # 공통 문자 비율
-    common_chars = set(query_norm) & set(result_norm)
-    if len(query_norm) > 0:
-        similarity = len(common_chars) / len(set(query_norm))
-        if similarity >= 0.7:
+    else:
+        if query_norm in result_norm:
             return True
+            
+    # Levenshtein distance (편집 거리) 기반 유사도
+    try:
+        from Levenshtein import ratio
+        if ratio(query_norm, result_norm) > 0.8:
+            return True
+    except ImportError:
+        # Levenshtein 라이브러리가 없을 경우, 기본적인 공통 문자 비율로 대체
+        common_chars = set(query_norm) & set(result_norm)
+        if len(set(query_norm)) > 0:
+            similarity = len(common_chars) / len(set(query_norm))
+            if similarity >= 0.7:
+                return True
     
     return False
 
@@ -1165,7 +1180,7 @@ def is_matching_law(query: str, result_name: str) -> bool:
 # 메인 UI
 def main():
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 ")
     
     # 사이드바
     with st.sidebar:
@@ -1194,28 +1209,34 @@ def main():
             if api_key:
                 st.session_state.openai_api_key = api_key
                 st.session_state.use_ai = True
-                st.success("✅ API 키가 설정되었습니다!")
-                
+                if 'api_key_valid' not in st.session_state or not st.session_state.api_key_valid:
+                     st.info("API 키가 입력되었습니다. 'API 키 테스트' 버튼으로 유효성을 확인하세요.")
+
                 # API 키 테스트 버튼
                 if st.button("🔍 API 키 테스트", type="secondary"):
-                    try:
-                        from openai import OpenAI
-                        client = OpenAI(api_key=api_key)
-                        
-                        # 간단한 테스트 요청
-                        response = client.chat.completions.create(
-                            model="gpt-3.5-turbo",
-                            messages=[{"role": "user", "content": "안녕하세요"}],
-                            max_tokens=10
-                        )
-                        st.success("✅ API 키가 정상적으로 작동합니다!")
-                    except ImportError:
-                        st.error("❌ OpenAI 라이브러리가 설치되지 않았습니다.")
-                        st.code("pip install openai", language="bash")
-                    except Exception as e:
-                        st.error(f"❌ API 키 오류: {str(e)}")
+                    with st.spinner("API 키를 확인하는 중..."):
+                        try:
+                            from openai import OpenAI
+                            client = OpenAI(api_key=api_key)
+                            
+                            # 간단한 테스트 요청
+                            response = client.chat.completions.create(
+                                model="gpt-3.5-turbo",
+                                messages=[{"role": "user", "content": "안녕하세요"}],
+                                max_tokens=10
+                            )
+                            st.success("✅ API 키가 정상적으로 작동합니다!")
+                            st.session_state.api_key_valid = True
+                        except ImportError:
+                            st.error("❌ OpenAI 라이브러리가 설치되지 않았습니다.")
+                            st.code("pip install openai", language="bash")
+                            st.session_state.api_key_valid = False
+                        except Exception as e:
+                            st.error(f"❌ API 키 오류: {str(e)}")
+                            st.session_state.api_key_valid = False
             else:
                 st.session_state.use_ai = False
+                st.session_state.api_key_valid = False
                 st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
         
         st.divider()
@@ -1231,10 +1252,10 @@ def main():
         
         # 직접 검색 모드
         if st.session_state.mode == 'direct':
-            law_name = st.text_input(
-                "법령명",
-                placeholder="예: 민법, 상법, 형법",
-                help="검색할 법령명을 입력하세요"
+            law_name = st.text_area(
+                "법령명 (여러 개 입력 가능)",
+                placeholder="예: 민법\n상법\n형법",
+                help="검색할 법령명을 한 줄에 하나씩 입력하세요."
             )
             
             search_btn = st.button("🔍 검색", type="primary", use_container_width=True)
@@ -1245,7 +1266,7 @@ def main():
             uploaded_file = st.file_uploader(
                 "파일 선택",
                 type=['pdf', 'xlsx', 'xls', 'md', 'txt'],
-                help="PDF, Excel, Markdown, 텍스트 파일을 지원합니다"
+                help="PDF, Excel, Markdown, 텍스트 파일을 지원합니다."
             )
             
             if uploaded_file:
@@ -1255,56 +1276,43 @@ def main():
         
         # 초기화 버튼
         if st.button("🔄 초기화", type="secondary", use_container_width=True):
-            # 세션 상태 초기화 (API 키는 유지)
-            keys_to_keep = ['mode', 'openai_api_key', 'use_ai']
+            # 세션 상태 초기화 (API 키와 유효성 상태는 유지)
+            keys_to_keep = ['openai_api_key', 'api_key_valid']
             for key in list(st.session_state.keys()):
                 if key not in keys_to_keep:
                     del st.session_state[key]
             st.rerun()
-    
+
     # 메인 컨텐츠
     collector = LawCollectorAPI()
-    
-    # 직접 검색 모드
+
+    # 분기 처리 (직접 검색 vs 파일 업로드)
     if st.session_state.mode == 'direct':
         st.header("🔍 직접 검색 모드")
-        
         if 'search_btn' in locals() and search_btn:
             if not oc_code:
                 st.error("기관코드를 입력해주세요!")
             elif not law_name:
                 st.error("법령명을 입력해주세요!")
             else:
-                with st.spinner(f"'{law_name}' 검색 중..."):
-                    results = collector.search_law(oc_code, law_name)
-                    
-                    if results:
-                        st.success(f"{len(results)}개의 법령을 찾았습니다!")
-                        st.session_state.search_results = results
-                    else:
-                        st.warning("검색 결과가 없습니다.")
-                        st.session_state.search_results = []
-        
-        # 검색 결과 표시
-        if st.session_state.search_results:
-            display_search_results_and_collect(collector, oc_code)
-    
-    # 파일 업로드 모드
-    else:
+                # 여러 줄 입력을 리스트로 변환
+                law_names_list = [name.strip() for name in law_name.split('\n') if name.strip()]
+                st.session_state.extracted_laws = law_names_list
+                st.session_state.file_processed = True # 검색 플래그로 사용
+                st.rerun() # 검색 프로세스를 위해 리런
+    else: # 파일 업로드 모드
         st.header("📄 파일 업로드 모드")
-        
         # AI 설정 상태 표시
         if st.session_state.use_ai:
             st.info("🤖 AI 강화 모드가 활성화되었습니다")
         else:
-            st.info("💡 AI 설정을 통해 법령명 추출 정확도를 높일 수 있습니다")
+            st.info("💡 사이드바의 AI 설정을 통해 법령명 추출 정확도를 높일 수 있습니다.")
         
         extractor = EnhancedLawFileExtractor()
         
         # 파일에서 법령 추출
-        if uploaded_file and not st.session_state.file_processed:
+        if 'uploaded_file' in locals() and uploaded_file and not st.session_state.get('file_processed', False):
             st.subheader("📋 STEP 1: 법령명 추출")
-            
             with st.spinner("파일에서 법령명을 추출하는 중..."):
                 file_type = uploaded_file.name.split('.')[-1].lower()
                 
@@ -1325,170 +1333,143 @@ def main():
                     st.success(f"✅ {len(extracted_laws)}개의 법령명을 찾았습니다!")
                     st.session_state.extracted_laws = extracted_laws
                     st.session_state.file_processed = True
+                    st.rerun()
                 else:
                     st.warning("파일에서 법령명을 찾을 수 없습니다")
+
+    # (공통 로직) 추출된 법령 목록 표시 및 검색 실행
+    if st.session_state.get('file_processed', False) and not st.session_state.get('search_results'):
+        st.subheader("✏️ STEP 2: 법령 검색 실행")
+        st.info("추출된 법령명 목록으로 법제처 API 검색을 시작합니다.")
         
-        # 추출된 법령 표시 및 편집
-        if st.session_state.extracted_laws:
-            st.subheader("✏️ STEP 2: 법령명 확인 및 편집")
-            st.info("추출된 법령명을 확인하고 필요시 수정하거나 추가할 수 있습니다")
-            
-            # 추출된 법령 목록 표시
-            st.write("**추출된 법령명:**")
-            for idx, law in enumerate(st.session_state.extracted_laws, 1):
-                st.write(f"{idx}. {law}")
-            
-            # 법령명 편집 영역
-            edited_laws = []
-            
-            st.write("\n**법령명 편집:**")
-            for idx, law_name in enumerate(st.session_state.extracted_laws):
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    edited_name = st.text_input(
-                        f"법령 {idx+1}",
-                        value=law_name,
-                        key=f"edit_{idx}"
-                    )
-                    if edited_name:
-                        edited_laws.append(edited_name)
-                with col2:
-                    if st.button("삭제", key=f"del_{idx}"):
-                        st.session_state.extracted_laws.pop(idx)
-                        st.rerun()
-            
-            # 법령명 추가
-            st.subheader("법령명 추가")
-            new_law = st.text_input("새 법령명 입력", key="new_law_input")
-            if st.button("➕ 추가") and new_law:
-                st.session_state.extracted_laws.append(new_law)
-                st.rerun()
-            
-            # 법령 검색 버튼
-            if st.button("🔍 법령 검색", type="primary", use_container_width=True):
-                if not oc_code:
-                    st.error("기관코드를 입력해주세요!")
+        with st.expander("검색 대상 법령명 보기", expanded=True):
+            st.write(st.session_state.extracted_laws)
+
+        if st.button("🔍 법령 검색 실행", type="primary", use_container_width=True):
+            if not oc_code:
+                st.error("기관코드를 입력해주세요!")
+            else:
+                # 검색 시작
+                search_results = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                total = len(st.session_state.extracted_laws)
+                no_result_laws = []
+                found_ids = set() # 중복 결과 방지
+
+                for idx, law_name in enumerate(st.session_state.extracted_laws):
+                    progress = (idx + 1) / total
+                    progress_bar.progress(progress)
+                    status_text.text(f"검색 중 ({idx+1}/{total}): {law_name}")
+                    
+                    # 다양한 형식으로 검색 시도
+                    search_variations_list = generate_search_variations(law_name)
+                    found_for_this_law = False
+                    
+                    for variation in search_variations_list:
+                        results = collector.search_law(oc_code, variation)
+                        
+                        if results:
+                            for result in results:
+                                if result['law_id'] not in found_ids and is_matching_law(law_name, result['law_name']):
+                                    result['search_query'] = law_name # 원본 검색어 추가
+                                    search_results.append(result)
+                                    found_ids.add(result['law_id'])
+                                    found_for_this_law = True
+                        if found_for_this_law:
+                           break # 현재 법령에 대한 매칭 결과를 찾았으면 다음 법령으로
+                    
+                    if not found_for_this_law:
+                        no_result_laws.append(law_name)
+                    
+                    time.sleep(collector.delay)
+                
+                progress_bar.progress(1.0)
+                status_text.text("검색 완료!")
+                
+                # 결과 표시
+                if search_results:
+                    st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
+                    st.session_state.search_results = search_results
                 else:
-                    # 검색 시작
-                    search_results = []
-                    progress_bar = st.progress(0)
-                    status_text = st.empty()
-                    
-                    # 수정된 법령명으로 업데이트
-                    if edited_laws:
-                        st.session_state.extracted_laws = edited_laws
-                    
-                    total = len(st.session_state.extracted_laws)
-                    no_result_laws = []
-                    
-                    for idx, law_name in enumerate(st.session_state.extracted_laws):
-                        progress = (idx + 1) / total
-                        progress_bar.progress(progress)
-                        status_text.text(f"검색 중: {law_name}")
-                        
-                        # 다양한 형식으로 검색 시도
-                        search_variations_list = generate_search_variations(law_name)
-                        found = False
-                        
-                        for variation in search_variations_list:
-                            results = collector.search_law(oc_code, variation)
-                            
-                            if results:
-                                for result in results:
-                                    if is_matching_law(law_name, result['law_name']):
-                                        result['search_query'] = law_name
-                                        search_results.append(result)
-                                        found = True
-                                        break
-                                
-                                if found:
-                                    break
-                        
-                        if not found:
-                            no_result_laws.append(law_name)
-                        
-                        time.sleep(collector.delay)
-                    
-                    progress_bar.progress(1.0)
-                    status_text.text("검색 완료!")
-                    
-                    # 결과 표시
-                    if search_results:
-                        st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
-                        st.session_state.search_results = search_results
-                    else:
-                        st.warning("검색 결과가 없습니다")
-                    
-                    # 검색 실패한 법령 목록 표시
-                    if no_result_laws:
-                        with st.expander(f"❌ 검색되지 않은 법령 ({len(no_result_laws)}개)"):
-                            for law in no_result_laws:
-                                st.write(f"- {law}")
-                            st.info("💡 Tip: 기관코드를 확인하거나, 법령명을 수정해보세요.")
-        
-        # 검색 결과 표시
-        if st.session_state.search_results:
-            display_search_results_and_collect(collector, oc_code, is_file_mode=True)
+                    st.warning("검색 결과가 없습니다")
+                
+                # 검색 실패한 법령 목록 표시
+                if no_result_laws:
+                    with st.expander(f"❌ 검색되지 않은 법령 ({len(no_result_laws)}개) "):
+                        for law in no_result_laws:
+                            st.write(f"- {law}")
+                        st.info("💡 Tip: 기관코드를 확인하거나, 법령명이 정확한지 확인해보세요.")
+                st.rerun()
+
+    # (공통 로직) 검색 결과 표시 및 수집
+    if st.session_state.search_results:
+        display_search_results_and_collect(collector, oc_code)
 
 
-def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str, is_file_mode: bool = False) -> None:
+def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str) -> None:
     """검색 결과 표시 및 수집 - 공통 함수"""
-    st.subheader("📑 검색 결과")
+    st.subheader("📑 STEP 3: 법령 선택 및 수집")
     
     # 전체 선택
-    select_all = st.checkbox("전체 선택", key="select_all_results")
+    select_all = st.checkbox("전체 선택", key="select_all_results", value=True)
     
     # 테이블 헤더
-    if is_file_mode:
-        col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
-        with col5:
-            st.markdown("**검색어**")
-    else:
-        col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
-    
-    with col1:
-        st.markdown("**선택**")
-    with col2:
-        st.markdown("**법령명**")
-    with col3:
-        st.markdown("**법종구분**")
-    with col4:
-        st.markdown("**시행일자**")
+    col_config = [1, 3, 2, 2, 2]
+    cols = st.columns(col_config)
+    cols[0].markdown("**선택**")
+    cols[1].markdown("**법령명**")
+    cols[2].markdown("**법종구분**")
+    cols[3].markdown("**시행일자**")
+    cols[4].markdown("**원본 검색어**")
     
     st.divider()
     
     # 선택된 법령
     selected_indices = []
     
-    for idx, law in enumerate(st.session_state.search_results):
-        if is_file_mode:
-            col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
-        else:
-            col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
-        
-        with col1:
-            is_selected = st.checkbox(
-                "선택", 
-                key=f"sel_{idx}", 
-                value=select_all,
-                label_visibility="collapsed"
-            )
-            if is_selected:
-                selected_indices.append(idx)
-        
-        with col2:
-            st.write(law['law_name'])
-        
-        with col3:
-            st.write(law.get('law_type', ''))
-        
-        with col4:
-            st.write(law.get('enforcement_date', ''))
-        
-        if is_file_mode:
-            with col5:
-                st.write(law.get('search_query', ''))
+    # 검색 결과를 원본 검색어 기준으로 그룹화
+    grouped_results = {}
+    for result in st.session_state.search_results:
+        query = result.get('search_query', '기타')
+        if query not in grouped_results:
+            grouped_results[query] = []
+        grouped_results[query].append(result)
+
+    # 그룹화된 결과를 순서대로 표시
+    original_order = st.session_state.extracted_laws
     
+    # 원본 순서에 없는 결과 (직접 검색 등으로 추가된 경우) 처리
+    all_queries_in_results = set(grouped_results.keys())
+    queries_in_order = [q for q in original_order if q in all_queries_in_results]
+    remaining_queries = sorted(list(all_queries_in_results - set(queries_in_order)))
+    display_order = queries_in_order + remaining_queries
+
+    current_idx = 0
+    for query in display_order:
+        st.markdown(f"**> 원본 검색어: `{query}`**")
+        for law in grouped_results[query]:
+            cols = st.columns(col_config)
+            
+            with cols[0]:
+                is_selected = st.checkbox(
+                    "선택", 
+                    key=f"sel_{current_idx}", 
+                    value=select_all,
+                    label_visibility="collapsed"
+                )
+                if is_selected:
+                    selected_indices.append(st.session_state.search_results.index(law))
+
+            cols[1].write(law['law_name'])
+            cols[2].write(law.get('law_type', ''))
+            cols[3].write(law.get('enforcement_date', ''))
+            # cols[4]는 그룹 헤더로 대체됨
+            current_idx += 1
+        st.divider()
+
+
     # 선택된 법령 저장
     st.session_state.selected_laws = [
         st.session_state.search_results[i] for i in selected_indices
@@ -1516,7 +1497,8 @@ def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str,
                     oc_code,
                     law['law_id'],
                     law.get('law_msn', ''),
-                    law['law_name']
+                    law['law_name'],
+                    law.get('law_type', '') # 법종구분 전달
                 )
                 
                 if law_detail:
@@ -1617,7 +1599,7 @@ def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str,
             )
         
         # 수집 결과 상세
-        with st.expander("📊 수집 결과 상세"):
+        with st.expander("📊 수집 결과 상세 보기"):
             for law_id, law in st.session_state.collected_laws.items():
                 st.subheader(law['law_name'])
                 col1, col2, col3 = st.columns(3)
@@ -1632,10 +1614,14 @@ def display_search_results_and_collect(collector: LawCollectorAPI, oc_code: str,
                 if law.get('articles'):
                     st.write("**샘플 조문:**")
                     sample = law['articles'][0]
-                    st.text(f"{sample['number']} {sample.get('title', '')}")
-                    content_preview = sample['content'][:200] + "..." if len(sample['content']) > 200 else sample['content']
-                    st.text(content_preview)
+                    st.code(f"{sample['number']} {sample.get('title', '')}\n" + \
+                          (sample['content'][:200] + "..." if len(sample['content']) > 200 else sample['content']),
+                          language='text')
 
 
 if __name__ == "__main__":
+    try:
+        from Levenshtein import ratio
+    except ImportError:
+        st.sidebar.warning("`python-Levenshtein` 라이브러리를 설치하면 법령명 매칭 정확도가 향상됩니다.\n\n`pip install python-Levenshtein`")
     main()
