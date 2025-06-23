@@ -9,7 +9,6 @@ import xml.etree.ElementTree as ET
 import json
 import time
 import re
-import os  # 환경 변수 사용을 위해 추가
 from datetime import datetime
 from io import BytesIO
 import base64
@@ -31,83 +30,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
-# Secrets에서 설정 로드 - 환경 변수 우선
-try:
-    # 1. 환경 변수에서 먼저 확인 (GitHub Actions, Docker 등)
-    OC_CODE = os.getenv('OC_CODE')
-    OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-    USE_AI = os.getenv('USE_AI', 'true').lower() == 'true'
-    API_DELAY = float(os.getenv('API_DELAY', '0.5'))
-    
-    # 2. 환경 변수가 없으면 Streamlit Secrets에서 로드
-    if not OC_CODE:
-        OC_CODE = st.secrets["api_keys"]["oc_code"]
-    
-    if not OPENAI_API_KEY:
-        OPENAI_API_KEY = st.secrets["api_keys"]["openai_api_key"]
-        
-    if 'USE_AI' not in os.environ:
-        USE_AI = st.secrets.get("settings", {}).get("use_ai", True)
-        
-    if 'API_DELAY' not in os.environ:
-        API_DELAY = st.secrets.get("settings", {}).get("api_delay", 0.5)
-    
-    # OpenAI 설정 (API 키가 있고 USE_AI가 true인 경우)
-    if OPENAI_API_KEY and USE_AI and OPENAI_API_KEY not in ["sk-your-openai-api-key-here", ""]:
-        try:
-            import openai
-            openai.api_key = OPENAI_API_KEY
-            AI_AVAILABLE = True
-        except ImportError:
-            AI_AVAILABLE = False
-            st.warning("⚠️ OpenAI 라이브러리가 설치되지 않았습니다. AI 기능을 사용하려면 'pip install openai'를 실행하세요.")
-    else:
-        AI_AVAILABLE = False
-        
-except Exception as e:
-    # Secrets 파일이 없거나 키가 없는 경우
-    # 환경 변수도 확인
-    if not os.getenv('OC_CODE'):
-        st.error("""
-        ⚠️ **설정이 필요합니다!**
-        
-        다음 방법 중 하나를 선택하세요:
-        
-        **방법 1: 로컬 개발 (Streamlit Secrets)**
-        1. 프로젝트 루트에 `.streamlit` 폴더 생성
-        2. `.streamlit/secrets.toml` 파일 생성
-        3. 다음 내용 추가:
-        ```toml
-        [api_keys]
-        oc_code = "your_oc_code"
-        openai_api_key = "sk-your-api-key"
-        
-        [settings]
-        use_ai = true
-        api_delay = 0.5
-        ```
-        
-        **방법 2: GitHub Actions / 프로덕션 (환경 변수)**
-        ```bash
-        export OC_CODE="your_oc_code"
-        export OPENAI_API_KEY="sk-your-api-key"
-        ```
-        
-        **방법 3: GitHub Repository Secrets**
-        1. Repository → Settings → Secrets and variables → Actions
-        2. New repository secret 추가:
-           - OC_CODE
-           - OPENAI_API_KEY
-        """)
-        st.stop()
-    else:
-        # 환경 변수에서 로드
-        OC_CODE = os.getenv('OC_CODE')
-        OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-        USE_AI = os.getenv('USE_AI', 'true').lower() == 'true'
-        API_DELAY = float(os.getenv('API_DELAY', '0.5'))
-        AI_AVAILABLE = False
 
 # 세션 상태 초기화
 if 'mode' not in st.session_state:
@@ -168,10 +90,6 @@ class EnhancedLawFileExtractor:
             r'^([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?(?:고시|훈령|예규|지침))(?:\s|$)',
         ]
         
-        # 전역 AI 설정 사용
-        self.use_ai = AI_AVAILABLE
-        self.api_key = OPENAI_API_KEY if AI_AVAILABLE else None
-        
     def extract_from_pdf(self, file) -> List[str]:
         """PDF 파일에서 법령명 추출 - 개선된 버전"""
         all_text = ""
@@ -199,74 +117,10 @@ class EnhancedLawFileExtractor:
         laws = self._extract_laws_from_pdf_structure(all_text)
         
         # AI 기반 추출이 설정되어 있으면 사용
-        if self.use_ai and self.api_key:
+        if hasattr(self, 'use_ai') and self.use_ai:
             laws = self._enhance_with_ai(all_text, laws)
         
         return sorted(list(laws))
-    
-    def _enhance_with_ai(self, text: str, initial_laws: Set[str]) -> Set[str]:
-        """ChatGPT API를 활용한 법령명 추출 개선"""
-        try:
-            import openai
-            openai.api_key = self.api_key
-            
-            # 텍스트 샘플 (토큰 제한을 위해 2000자로 제한)
-            sample_text = text[:2000]
-            
-            prompt = f"""다음은 법령 관련 PDF에서 추출한 텍스트입니다.
-이 텍스트에서 실제 법령명만 정확히 추출해주세요.
-
-중요한 규칙:
-1. "상하위법", "행정규칙", "관련법령" 같은 카테고리는 제외하세요
-2. 법령명은 완전한 형태로 추출하세요 (예: "금융기관 검사 및 제재에 관한 규정")
-3. 시행령, 시행규칙은 기본 법률과 별도로 구분하세요
-4. 중복은 제거하세요
-5. 시행 날짜 정보는 제외하세요
-
-텍스트:
-{sample_text}
-
-현재 추출된 법령명:
-{', '.join(list(initial_laws)[:10])}
-
-정확한 법령명을 한 줄에 하나씩 출력하세요:"""
-            
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[
-                    {"role": "system", "content": "당신은 한국 법령 전문가입니다. 법령명을 정확히 식별하고 추출하는 전문가입니다."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=800
-            )
-            
-            # AI 응답 파싱
-            ai_laws = set()
-            ai_response = response.choices[0].message.content.strip()
-            
-            for line in ai_response.split('\n'):
-                line = line.strip()
-                
-                # 번호나 기호 제거
-                line = re.sub(r'^[\d\-\.\*\•]+\s*', '', line)
-                
-                if line and self._is_valid_law_name(line):
-                    ai_laws.add(line)
-            
-            # 기존 결과와 AI 결과 병합
-            if ai_laws:
-                st.info(f"🤖 AI가 {len(ai_laws)}개의 법령명을 추가로 발견했습니다")
-                return initial_laws.union(ai_laws)
-            else:
-                return initial_laws
-                
-        except ImportError:
-            st.warning("⚠️ OpenAI 라이브러리가 설치되지 않았습니다. 터미널에서 'pip install openai' 명령을 실행해주세요.")
-            return initial_laws
-        except Exception as e:
-            st.warning(f"⚠️ AI 추출 중 오류: {str(e)}")
-            return initial_laws
     
     def _extract_laws_from_text(self, text: str) -> Set[str]:
         """텍스트에서 법령명 추출 - 개선된 버전"""
@@ -557,13 +411,12 @@ class LawCollectorAPI:
     def __init__(self):
         self.law_search_url = "http://www.law.go.kr/DRF/lawSearch.do"
         self.law_detail_url = "http://www.law.go.kr/DRF/lawService.do"
-        self.delay = API_DELAY  # Secrets에서 로드된 설정 사용
-        self.oc_code = OC_CODE  # Secrets에서 로드된 기관코드 사용
+        self.delay = 0.5  # API 호출 간격
         
-    def search_law(self, law_name: str):
+    def search_law(self, oc_code: str, law_name: str):
         """법령 검색"""
         params = {
-            'OC': self.oc_code,
+            'OC': oc_code,
             'target': 'law',
             'type': 'XML',
             'query': law_name,
@@ -615,10 +468,10 @@ class LawCollectorAPI:
             st.error(f"검색 오류: {str(e)}")
             return []
     
-    def get_law_detail_with_full_content(self, law_id: str, law_msn: str, law_name: str):
+    def get_law_detail_with_full_content(self, oc_code: str, law_id: str, law_msn: str, law_name: str):
         """법령 상세 정보 수집 - 조문, 부칙, 별표 모두 포함"""
         params = {
-            'OC': self.oc_code,
+            'OC': oc_code,
             'target': 'law',
             'type': 'XML',
             'MST': law_msn,
@@ -1177,28 +1030,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ 설정")
         
-        # Secrets에서 로드된 설정 표시
-        with st.expander("🔐 API 설정 상태", expanded=True):
-            # 기관코드 상태
-            if OC_CODE and OC_CODE != "your_oc_code_here":
-                st.success(f"✅ 기관코드: {OC_CODE[:2]}***")
-            else:
-                st.error("❌ 기관코드가 설정되지 않았습니다")
-                
-            # AI 설정 상태
-            if AI_AVAILABLE:
-                st.success("✅ AI 기능: 활성화됨")
-                st.caption("ChatGPT를 사용하여 법령명 추출 정확도를 높입니다")
-            else:
-                if OPENAI_API_KEY == "sk-your-openai-api-key-here":
-                    st.warning("⚠️ AI 기능: 비활성화 (API 키 미설정)")
-                elif not USE_AI:
-                    st.info("ℹ️ AI 기능: 비활성화 (설정에서 비활성화됨)")
-                else:
-                    st.warning("⚠️ AI 기능: 비활성화 (OpenAI 라이브러리 미설치)")
-            
-            # 설정 파일 경로 안내
-            st.caption("설정 변경: `.streamlit/secrets.toml` 파일 수정")
+        # 기관코드 입력
+        oc_code = st.text_input(
+            "기관코드 (OC)",
+            placeholder="이메일 @ 앞부분",
+            help="예: test@korea.kr → test"
+        )
         
         st.divider()
         
@@ -1252,11 +1089,13 @@ def main():
         st.header("🔍 직접 검색 모드")
         
         if 'search_btn' in locals() and search_btn:
-            if not law_name:
+            if not oc_code:
+                st.error("기관코드를 입력해주세요!")
+            elif not law_name:
                 st.error("법령명을 입력해주세요!")
             else:
                 with st.spinner(f"'{law_name}' 검색 중..."):
-                    results = collector.search_law(law_name)
+                    results = collector.search_law(oc_code, law_name)
                     
                     if results:
                         st.success(f"{len(results)}개의 법령을 찾았습니다!")
@@ -1267,7 +1106,7 @@ def main():
         
         # 검색 결과 표시
         if st.session_state.search_results:
-            display_search_results_and_collect(collector)
+            display_search_results_and_collect(collector, oc_code)
     
     # 파일 업로드 모드
     else:
@@ -1339,48 +1178,51 @@ def main():
             
             # 법령 검색 버튼
             if st.button("🔍 법령 검색", type="primary", use_container_width=True):
-                # 검색 시작
-                search_results = []
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                # 수정된 법령명으로 업데이트
-                if edited_laws:
-                    st.session_state.extracted_laws = edited_laws
-                
-                total = len(st.session_state.extracted_laws)
-                
-                for idx, law_name in enumerate(st.session_state.extracted_laws):
-                    progress = (idx + 1) / total
-                    progress_bar.progress(progress)
-                    status_text.text(f"검색 중: {law_name}")
-                    
-                    # API 검색
-                    results = collector.search_law(law_name)
-                    
-                    for result in results:
-                        # 검색어와 유사한 결과만 포함
-                        if law_name in result['law_name'] or result['law_name'] in law_name:
-                            result['search_query'] = law_name
-                            search_results.append(result)
-                    
-                    time.sleep(collector.delay)
-                
-                progress_bar.progress(1.0)
-                status_text.text("검색 완료!")
-                
-                if search_results:
-                    st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
-                    st.session_state.search_results = search_results
+                if not oc_code:
+                    st.error("기관코드를 입력해주세요!")
                 else:
-                    st.warning("검색 결과가 없습니다")
+                    # 검색 시작
+                    search_results = []
+                    progress_bar = st.progress(0)
+                    status_text = st.empty()
+                    
+                    # 수정된 법령명으로 업데이트
+                    if edited_laws:
+                        st.session_state.extracted_laws = edited_laws
+                    
+                    total = len(st.session_state.extracted_laws)
+                    
+                    for idx, law_name in enumerate(st.session_state.extracted_laws):
+                        progress = (idx + 1) / total
+                        progress_bar.progress(progress)
+                        status_text.text(f"검색 중: {law_name}")
+                        
+                        # API 검색
+                        results = collector.search_law(oc_code, law_name)
+                        
+                        for result in results:
+                            # 검색어와 유사한 결과만 포함
+                            if law_name in result['law_name'] or result['law_name'] in law_name:
+                                result['search_query'] = law_name
+                                search_results.append(result)
+                        
+                        time.sleep(collector.delay)
+                    
+                    progress_bar.progress(1.0)
+                    status_text.text("검색 완료!")
+                    
+                    if search_results:
+                        st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
+                        st.session_state.search_results = search_results
+                    else:
+                        st.warning("검색 결과가 없습니다")
         
         # 검색 결과 표시
         if st.session_state.search_results:
-            display_search_results_and_collect(collector, is_file_mode=True)
+            display_search_results_and_collect(collector, oc_code, is_file_mode=True)
 
 
-def display_search_results_and_collect(collector, is_file_mode=False):
+def display_search_results_and_collect(collector, oc_code, is_file_mode=False):
     """검색 결과 표시 및 수집 - 공통 함수"""
     st.subheader("📑 검색 결과")
     
@@ -1457,6 +1299,7 @@ def display_search_results_and_collect(collector, is_file_mode=False):
                 
                 # 상세 정보 수집
                 law_detail = collector.get_law_detail_with_full_content(
+                    oc_code,
                     law['law_id'],
                     law.get('law_msn', ''),
                     law['law_name']
