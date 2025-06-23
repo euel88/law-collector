@@ -10,7 +10,8 @@ import xml.etree.ElementTree as ET
 import json
 import time
 import re
-import pandas as pd
+# pandas 제거 - Python 3.13 호환성 문제
+# import pandas as pd
 from datetime import datetime
 from bs4 import BeautifulSoup
 import urllib3
@@ -414,29 +415,24 @@ def main():
     if st.session_state.search_results:
         st.subheader("🔎 검색 결과")
         
-        # 선택 가능한 테이블로 표시
-        df = pd.DataFrame(st.session_state.search_results)
-        df['선택'] = False
+        # 테이블 직접 생성 (pandas 대신)
+        st.write("수집할 법령을 선택하세요 (체크박스 클릭):")
         
-        edited_df = st.data_editor(
-            df[['선택', 'law_name', 'law_type', 'enforcement_date']],
-            column_config={
-                "선택": st.column_config.CheckboxColumn(
-                    "선택",
-                    help="수집할 법령을 선택하세요",
-                    default=False,
-                ),
-                "law_name": "법령명",
-                "law_type": "법종구분",
-                "enforcement_date": "시행일자"
-            },
-            disabled=['law_name', 'law_type', 'enforcement_date'],
-            hide_index=True,
-            use_container_width=True
-        )
+        selected_indices = []
+        for i, law in enumerate(st.session_state.search_results):
+            col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+            with col1:
+                if st.checkbox("", key=f"select_{i}"):
+                    selected_indices.append(i)
+            with col2:
+                st.write(law['law_name'])
+            with col3:
+                st.write(law['law_type'])
+            with col4:
+                st.write(law['enforcement_date'])
         
         # 선택된 법령 목록
-        selected_laws = df[edited_df['선택']].to_dict('records')
+        selected_laws = [st.session_state.search_results[i] for i in selected_indices]
         
         if selected_laws:
             st.info(f"{len(selected_laws)}개 법령이 선택되었습니다.")
