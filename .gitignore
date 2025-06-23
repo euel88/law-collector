@@ -1,35 +1,270 @@
-# Streamlit secrets
-.streamlit/secrets.toml
-.streamlit/secrets.json
+###########################################
+# Streamlit Law Collector Project
+# Last Updated: 2024
+###########################################
 
-# API keys and secrets
-secrets.toml
-config.toml
-
-# Python
+### Python ###
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# C extensions
 *.so
+
+# Distribution / packaging
 .Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+### Virtual Environments ###
+# virtualenv
 env/
 venv/
 ENV/
+env.bak/
+venv.bak/
+.venv/
 
-# IDE
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+.poetry/
+
+# pyenv
+.python-version
+
+# conda
+conda-meta/
+*.conda
+*.tar.bz2
+
+### Testing ###
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+test-results/
+junit.xml
+
+# Test databases
+*.db
+*.sqlite
+*.sqlite3
+test_*.db
+
+### Streamlit Specific ###
+# Streamlit secrets and configs
+.streamlit/secrets.toml
+.streamlit/secrets.json
+.streamlit/config.toml
+.streamlit/*.toml
+!.streamlit/config.toml.example
+
+# Streamlit cache
+.streamlit/cache/
+*.cache
+
+### Security & Secrets ###
+# API keys and secrets
+secrets.toml
+config.toml
+.env
+.env.*
+!.env.example
+!.env.template
+
+# AWS
+.aws/
+aws_credentials
+
+# Google Cloud
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+service-account-*.json
+gcp-key.json
+
+# Azure
+*.publishsettings
+*.azureauth
+
+# General credentials
+*.pem
+*.key
+*.cert
+*.crt
+*.p12
+*.pfx
+
+### IDE & Editors ###
+# Visual Studio Code
 .vscode/
+!.vscode/settings.json.example
+!.vscode/launch.json.example
+*.code-workspace
+
+# PyCharm
 .idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim
 *.swp
 *.swo
+*.swn
+.*.swp
+*~
 
-# OS
+# Emacs
+*~
+\#*\#
+.\#*
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+!examples/*.ipynb
+
+### Operating System ###
+# macOS
 .DS_Store
-Thumbs.db
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
 
-# Logs
-*.log
-logs/
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+
+### Project Specific ###
+# Data files (법령 수집 관련)
+collected_laws/
+laws_data/
+*.xlsx
+*.xls
+*.pdf
+!sample_data/*.xlsx
+!sample_data/*.pdf
+!docs/*.pdf
+
+# Output files
+output/
+exports/
+downloads/
+results/
+*.zip
+!test_data/*.zip
 
 # Temporary files
 *.tmp
 *.temp
+*.bak
+*.backup
+*.old
+.~*
+
+# Log files
+*.log
+logs/
+*.log.*
+!logs/.gitkeep
+
+# Cache directories
+cache/
+.cache/
+__cache__/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+local.db
+dev.db
+
+### Documentation ###
+# Sphinx documentation
+docs/_build/
+docs/_static/generated/
+
+# mkdocs documentation
+site/
+
+### CI/CD ###
+# GitHub Actions
+.github/actions/*/dist/
+.github/actions/*/lib/
+!.github/
+
+# Pre-commit
+.pre-commit-config.yaml
+!.pre-commit-config.yaml
+
+### Miscellaneous ###
+# Backup files
+*.backup
+*.bak
+*.orig
+
+# Lock files (keep for reproducibility)
+!Pipfile.lock
+!poetry.lock
+!yarn.lock
+!package-lock.json
+
+# Keep empty directories
+!.gitkeep
+!*/.gitkeep
+
+###########################################
+# End of .gitignore
+###########################################
