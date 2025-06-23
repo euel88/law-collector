@@ -56,8 +56,17 @@ class EnhancedLawFileExtractor:
             '총리령', '부령', '관한 규정', '상위법', '하위법', '관련법령'
         ]
         
-        # 개선된 법령명 패턴
+        # 개선된 법령명 패턴 - 행정규칙 우선 배치
         self.law_patterns = [
+            # 패턴 0: 독립적인 규정/세칙 (행정규칙) - 최우선 매칭
+            r'([가-힣]+(?:(?:\s+및\s+)|(?:\s+))?[가-힣]*(?:에\s*관한\s*)?(?:규정|업무규정|감독규정|운영규정|관리규정))\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 0-1: 시행세칙 (독립적)
+            r'([가-힣]+(?:(?:\s+및\s+)|(?:\s+))?[가-힣]*(?:업무)?시행세칙)\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 0-2: 붙어있는 형태의 규정 처리
+            r'([가-힣]+(?:검사및제재에관한|에관한)?규정)\s*(?:\[시행[^\]]+\])?',
+            
             # 패턴 1: 일반적인 법률명 (띄어쓰기 포함)
             r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?)\s*(?:\[시행[^\]]+\])?',
             
@@ -67,20 +76,14 @@ class EnhancedLawFileExtractor:
             # 패턴 3: 시행규칙 (개선됨)
             r'([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s+시행규칙\s*(?:\[시행[^\]]+\])?',
             
-            # 패턴 4: 감독규정 (띄어쓰기 허용)
-            r'([가-힣]+(?:\s+[가-힣]+)*감독규정)\s*(?:\[시행[^\]]+\])?',
+            # 패턴 4: 규정 + 시행세칙 조합
+            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?규정\s+시행세칙)\s*(?:\[시행[^\]]+\])?',
             
-            # 패턴 5: 업무시행세칙
-            r'([가-힣]+(?:\s+[가-힣]+)*업무시행세칙)\s*(?:\[시행[^\]]+\])?',
-            
-            # 패턴 6: ~에 관한 규정 (개선됨)
-            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?규정)(?:\s+시행세칙)?\s*(?:\[시행[^\]]+\])?',
-            
-            # 패턴 7: 분류 (한국표준산업분류 등)
+            # 패턴 5: 분류 (한국표준산업분류 등)
             r'([가-힣]+(?:\s+[가-힣]+)*분류)\s*(?:\[시행[^\]]+\])?',
             
-            # 패턴 8: 시행세칙이 포함된 규정
-            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?규정\s+시행세칙)\s*(?:\[시행[^\]]+\])?',
+            # 패턴 6: 고시, 훈령, 예규
+            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?(?:고시|훈령|예규|지침))\s*(?:\[시행[^\]]+\])?',
         ]
         
     def extract_from_pdf(self, file) -> List[str]:
@@ -129,6 +132,9 @@ class EnhancedLawFileExtractor:
         # 3. 특수 케이스 처리 (합성어)
         laws.update(self._extract_compound_laws(text))
         
+        # 4. 추가: 붙어있는 형태의 행정규칙 처리
+        laws.update(self._extract_attached_regulations(text))
+        
         return laws
     
     def _preprocess_text(self, text: str) -> str:
@@ -140,7 +146,36 @@ class EnhancedLawFileExtractor:
         # 예: "금융기관\n검사 및 제재에 관한 규정"
         text = re.sub(r'([가-힣]+)\s*\n\s*([가-힣]+(?:\s+및\s+)?[가-힣]*(?:에\s*관한)?)', r'\1 \2', text)
         
+        # "및" 주변의 공백 정규화
+        text = re.sub(r'\s*및\s*', ' 및 ', text)
+        
         return text
+    
+    def _extract_attached_regulations(self, text: str) -> Set[str]:
+        """붙어있는 형태의 행정규칙 추출"""
+        attached_laws = set()
+        
+        # 특별 패턴들 (띄어쓰기 없이 붙어있는 경우)
+        special_patterns = [
+            r'금융기관검사및제재에관한규정',
+            r'여신전문금융업감독규정',
+            r'여신전문금융업감독업무시행세칙',
+            r'[가-힣]+검사및[가-힣]+에관한규정',
+            r'[가-힣]+감독업무시행세칙'
+        ]
+        
+        for pattern in special_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                # 띄어쓰기 추가하여 정규화
+                normalized = match
+                normalized = re.sub(r'검사및', '검사 및 ', normalized)
+                normalized = re.sub(r'에관한', '에 관한 ', normalized)
+                normalized = re.sub(r'업무시행', '업무 시행', normalized)
+                
+                attached_laws.add(self._clean_law_name(normalized))
+        
+        return attached_laws
     
     def _clean_law_name(self, law_name: str) -> str:
         """법령명 정제"""
@@ -156,6 +191,10 @@ class EnhancedLawFileExtractor:
         
         # 연속된 공백을 하나로
         law_name = ' '.join(law_name.split())
+        
+        # 붙어있는 형태 정규화
+        law_name = re.sub(r'검사및', '검사 및 ', law_name)
+        law_name = re.sub(r'에관한', '에 관한 ', law_name)
         
         return law_name
     
@@ -174,8 +213,8 @@ class EnhancedLawFileExtractor:
         if not korean_chars or max(len(k) for k in korean_chars) < 2:
             return False
         
-        # 법령 관련 키워드가 포함되어 있어야 함
-        law_keywords = ['법', '령', '규칙', '규정', '고시', '훈령', '예규', '지침', '세칙', '분류']
+        # 법령 관련 키워드가 포함되어 있어야 함 - 확장된 키워드 목록
+        law_keywords = ['법', '령', '규칙', '규정', '고시', '훈령', '예규', '지침', '세칙', '분류', '업무규정', '감독규정']
         if not any(keyword in law_name for keyword in law_keywords):
             return False
         
@@ -607,7 +646,7 @@ class LawCollectorAPI:
         return ' '.join(texts)
     
     def export_to_zip(self, laws_dict):
-        """수집된 법령을 ZIP으로 내보내기"""
+        """수집된 법령을 ZIP으로 내보내기 - MD 지원 추가"""
         zip_buffer = BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -622,6 +661,10 @@ class LawCollectorAPI:
                 'all_laws.json',
                 json.dumps(all_data, ensure_ascii=False, indent=2)
             )
+            
+            # 전체 통합 MD 파일 생성
+            all_laws_md = self._create_all_laws_markdown(laws_dict)
+            zip_file.writestr('all_laws.md', all_laws_md)
             
             # 개별 법령 파일
             for law_id, law in laws_dict.items():
@@ -639,6 +682,13 @@ class LawCollectorAPI:
                     f'laws/{safe_name}.txt',
                     text_content
                 )
+                
+                # Markdown 파일 추가
+                md_content = self._format_law_markdown(law)
+                zip_file.writestr(
+                    f'laws/{safe_name}.md',
+                    md_content
+                )
             
             # README 파일
             readme = self._create_readme(laws_dict)
@@ -646,6 +696,120 @@ class LawCollectorAPI:
         
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
+    
+    def _format_law_markdown(self, law):
+        """개별 법령을 Markdown으로 포맷"""
+        lines = []
+        
+        # 제목
+        lines.append(f"# {law['law_name']}\n")
+        
+        # 메타데이터
+        lines.append("## 📋 기본 정보\n")
+        lines.append(f"- **법종구분**: {law.get('law_type', '')}")
+        lines.append(f"- **공포일자**: {law.get('promulgation_date', '')}")
+        lines.append(f"- **시행일자**: {law.get('enforcement_date', '')}")
+        lines.append(f"- **법령ID**: {law.get('law_id', '')}")
+        lines.append("")
+        
+        # 조문
+        if law.get('articles'):
+            lines.append("## 📖 조문\n")
+            for article in law['articles']:
+                lines.append(f"### {article['number']}")
+                if article.get('title'):
+                    lines.append(f"**{article['title']}**\n")
+                
+                lines.append(article['content'])
+                
+                # 항
+                if article.get('paragraphs'):
+                    for para in article['paragraphs']:
+                        lines.append(f"\n> {para['number']} {para['content']}")
+                
+                lines.append("")
+        
+        # 부칙
+        if law.get('supplementary_provisions'):
+            lines.append("\n## 📌 부칙\n")
+            for idx, supp in enumerate(law['supplementary_provisions'], 1):
+                if supp.get('promulgation_date'):
+                    lines.append(f"### 부칙 <{supp['promulgation_date']}>")
+                else:
+                    lines.append(f"### 부칙 {idx}")
+                lines.append(f"\n{supp['content']}\n")
+        
+        # 별표/별첨
+        if law.get('attachments'):
+            lines.append("\n## 📎 별표/별첨\n")
+            for attach in law['attachments']:
+                lines.append(f"### [{attach['type']}] {attach.get('title', '')}")
+                lines.append(f"\n{attach['content']}\n")
+        
+        # 원문 (조문이 없는 경우)
+        if not law.get('articles') and law.get('raw_content'):
+            lines.append("\n## 📄 원문\n")
+            lines.append(law['raw_content'])
+        
+        return '\n'.join(lines)
+    
+    def _create_all_laws_markdown(self, laws_dict):
+        """전체 법령을 하나의 Markdown으로 생성"""
+        lines = []
+        
+        # 헤더
+        lines.append("# 📚 법령 수집 결과 (전체)\n")
+        lines.append(f"**수집 일시**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"**총 법령 수**: {len(laws_dict)}개\n")
+        
+        # 목차
+        lines.append("## 📑 목차\n")
+        for idx, (law_id, law) in enumerate(laws_dict.items(), 1):
+            # 앵커 링크 생성 (특수문자 제거)
+            anchor = re.sub(r'[^가-힣a-zA-Z0-9]', '', law['law_name'])
+            lines.append(f"{idx}. [{law['law_name']}](#{anchor})")
+        lines.append("")
+        
+        # 구분선
+        lines.append("---\n")
+        
+        # 각 법령 내용
+        for law_id, law in laws_dict.items():
+            # 앵커를 위한 ID
+            anchor = re.sub(r'[^가-힣a-zA-Z0-9]', '', law['law_name'])
+            lines.append(f'<div id="{anchor}"></div>\n')
+            
+            # 법령 내용 추가
+            lines.append(self._format_law_markdown(law))
+            lines.append("\n---\n")
+        
+        return '\n'.join(lines)
+    
+    def export_single_file(self, laws_dict, format='json'):
+        """선택한 법령들을 하나의 파일로 내보내기"""
+        if format == 'json':
+            data = {
+                'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'total_laws': len(laws_dict),
+                'laws': laws_dict
+            }
+            return json.dumps(data, ensure_ascii=False, indent=2)
+        
+        elif format == 'markdown':
+            return self._create_all_laws_markdown(laws_dict)
+        
+        elif format == 'text':
+            lines = []
+            lines.append(f"법령 수집 결과")
+            lines.append(f"수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            lines.append(f"총 법령 수: {len(laws_dict)}개")
+            lines.append("="*80 + "\n")
+            
+            for law_id, law in laws_dict.items():
+                lines.append(self._format_law_full_text(law))
+                lines.append("\n" + "="*80 + "\n")
+            
+            return '\n'.join(lines)
     
     def _format_law_full_text(self, law):
         """법령 전체 내용을 텍스트로 포맷"""
@@ -699,7 +863,7 @@ class LawCollectorAPI:
         return '\n'.join(lines)
     
     def _create_readme(self, laws_dict):
-        """README 생성"""
+        """README 생성 - 개선된 버전"""
         content = f"""# 법령 수집 결과
 
 수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -708,9 +872,11 @@ class LawCollectorAPI:
 ## 📁 파일 구조
 
 - `all_laws.json`: 전체 법령 데이터 (JSON)
+- `all_laws.md`: 전체 법령 통합 문서 (Markdown)
 - `laws/`: 개별 법령 파일 디렉토리
   - `*.json`: 법령별 상세 데이터
   - `*.txt`: 법령별 전체 텍스트 (조문, 부칙, 별표 포함)
+  - `*.md`: 법령별 Markdown 문서
 - `README.md`: 이 파일
 
 ## 📊 수집 통계
@@ -1056,34 +1222,71 @@ def display_search_results_and_collect(collector, oc_code, is_file_mode=False):
     if st.session_state.collected_laws:
         st.header("💾 다운로드")
         
-        col1, col2 = st.columns(2)
+        # 다운로드 옵션 선택
+        st.subheader("📥 다운로드 옵션")
+        download_option = st.radio(
+            "다운로드 방식 선택",
+            ["개별 파일 (ZIP)", "통합 파일 (단일)"],
+            help="개별 파일: 각 법령별로 파일 생성\n통합 파일: 모든 법령을 하나의 파일로"
+        )
         
-        with col1:
-            # JSON 다운로드
-            json_data = {
-                'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'mode': st.session_state.mode,
-                'laws': st.session_state.collected_laws
-            }
-            json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
+        if download_option == "개별 파일 (ZIP)":
+            col1, col2 = st.columns(2)
             
-            st.download_button(
-                label="📄 JSON 다운로드",
-                data=json_str,
-                file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
+            with col1:
+                # JSON 다운로드
+                json_data = {
+                    'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'mode': st.session_state.mode,
+                    'laws': st.session_state.collected_laws
+                }
+                json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
+                
+                st.download_button(
+                    label="📄 JSON 다운로드",
+                    data=json_str,
+                    file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+            
+            with col2:
+                # ZIP 다운로드 (MD 포함)
+                zip_data = collector.export_to_zip(st.session_state.collected_laws)
+                
+                st.download_button(
+                    label="📦 ZIP 다운로드 (JSON+TXT+MD)",
+                    data=zip_data,
+                    file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                    mime="application/zip",
+                    use_container_width=True
+                )
+        
+        else:  # 통합 파일
+            file_format = st.selectbox(
+                "파일 형식 선택",
+                ["JSON", "Markdown", "Text"],
+                help="모든 법령을 하나의 파일로 통합합니다"
             )
-        
-        with col2:
-            # ZIP 다운로드
-            zip_data = collector.export_to_zip(st.session_state.collected_laws)
+            
+            if file_format == "JSON":
+                content = collector.export_single_file(st.session_state.collected_laws, 'json')
+                mime = "application/json"
+                extension = "json"
+            elif file_format == "Markdown":
+                content = collector.export_single_file(st.session_state.collected_laws, 'markdown')
+                mime = "text/markdown"
+                extension = "md"
+            else:  # Text
+                content = collector.export_single_file(st.session_state.collected_laws, 'text')
+                mime = "text/plain"
+                extension = "txt"
             
             st.download_button(
-                label="📦 ZIP 다운로드 (전체 내용)",
-                data=zip_data,
-                file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip",
+                label=f"💾 {file_format} 통합 파일 다운로드",
+                data=content,
+                file_name=f"all_laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{extension}",
+                mime=mime,
                 use_container_width=True
             )
         
