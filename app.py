@@ -1,9 +1,6 @@
 """
-법령 수집기 - 체계도 및 조문 수집 문제 수정 버전
-주요 수정사항:
-1. 체계도 정보 세션 상태 저장 문제 해결
-2. 조문 XML 파싱 로직 개선
-3. 마크다운 리포트 생성 시 체계도 정보 포함
+파일 기반 법령 수집기
+사용자가 업로드한 법령체계도 파일(PDF/Excel/MD)에서 법령 목록을 추출하여 수집
 """
 
 import streamlit as st
@@ -17,42 +14,142 @@ from io import BytesIO
 import base64
 import urllib3
 import zipfile
+import pandas as pd
+import openpyxl
+import PyPDF2
+import pdfplumber
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 페이지 설정
 st.set_page_config(
-    page_title="법제처 법령 수집기",
+    page_title="법제처 법령 수집기 - 파일 업로드",
     page_icon="📚",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 # 세션 상태 초기화
-if 'collected_laws' not in st.session_state:
-    st.session_state.collected_laws = {}
-if 'collected_hierarchy' not in st.session_state:
-    st.session_state.collected_hierarchy = {}
-if 'collected_precs' not in st.session_state:
-    st.session_state.collected_precs = []
+if 'extracted_laws' not in st.session_state:
+    st.session_state.extracted_laws = []
 if 'search_results' not in st.session_state:
     st.session_state.search_results = []
 if 'selected_laws' not in st.session_state:
     st.session_state.selected_laws = []
-if 'hierarchy_laws' not in st.session_state:
-    st.session_state.hierarchy_laws = []
-if 'selected_hierarchy_laws' not in st.session_state:
-    st.session_state.selected_hierarchy_laws = []
+if 'collected_laws' not in st.session_state:
+    st.session_state.collected_laws = {}
+if 'file_processed' not in st.session_state:
+    st.session_state.file_processed = False
 
-class LawCollectorStreamlit:
-    """Streamlit용 법령 수집기 - API 직접 호출 방식"""
+class LawFileExtractor:
+    """파일에서 법령명 추출하는 클래스"""
+    
+    def __init__(self):
+        # 법령명 패턴 (다양한 형태 지원)
+        self.law_patterns = [
+            r'([가-힣]+(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?(?:\s*시행령|\s*시행규칙)?)',
+            r'([가-힣]+에\s*관한\s*(?:특별|기본)?법(?:률)?(?:\s*시행령|\s*시행규칙)?)',
+            r'([가-힣]+\s*(?:법|령|규칙|규정|고시|훈령|예규|지침))',
+            r'「([^」]+)」',  # 법령명이 「」 안에 있는 경우
+        ]
+        
+    def extract_from_pdf(self, file):
+        """PDF 파일에서 법령명 추출"""
+        laws = set()
+        
+        try:
+            # pdfplumber 사용 (텍스트 추출이 더 정확함)
+            with pdfplumber.open(file) as pdf:
+                for page in pdf.pages:
+                    text = page.extract_text()
+                    if text:
+                        laws.update(self._extract_law_names(text))
+        except:
+            # 실패 시 PyPDF2로 시도
+            try:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text = page.extract_text()
+                    laws.update(self._extract_law_names(text))
+            except Exception as e:
+                st.error(f"PDF 읽기 오류: {str(e)}")
+        
+        return list(laws)
+    
+    def extract_from_excel(self, file):
+        """Excel 파일에서 법령명 추출"""
+        laws = set()
+        
+        try:
+            # 모든 시트 읽기
+            excel_file = pd.ExcelFile(file)
+            
+            for sheet_name in excel_file.sheet_names:
+                df = pd.read_excel(file, sheet_name=sheet_name)
+                
+                # 모든 셀에서 법령명 추출
+                for column in df.columns:
+                    for value in df[column].dropna():
+                        if isinstance(value, str):
+                            laws.update(self._extract_law_names(value))
+        except Exception as e:
+            st.error(f"Excel 읽기 오류: {str(e)}")
+        
+        return list(laws)
+    
+    def extract_from_markdown(self, file):
+        """Markdown 파일에서 법령명 추출"""
+        laws = set()
+        
+        try:
+            content = file.read().decode('utf-8')
+            laws.update(self._extract_law_names(content))
+        except Exception as e:
+            st.error(f"Markdown 읽기 오류: {str(e)}")
+        
+        return list(laws)
+    
+    def extract_from_text(self, file):
+        """텍스트 파일에서 법령명 추출"""
+        laws = set()
+        
+        try:
+            content = file.read().decode('utf-8')
+            laws.update(self._extract_law_names(content))
+        except Exception as e:
+            st.error(f"텍스트 파일 읽기 오류: {str(e)}")
+        
+        return list(laws)
+    
+    def _extract_law_names(self, text):
+        """텍스트에서 법령명 추출"""
+        laws = set()
+        
+        for pattern in self.law_patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                # 정제
+                law_name = match.strip()
+                # 너무 짧거나 긴 것은 제외
+                if 3 <= len(law_name) <= 50:
+                    # 불필요한 문자 제거
+                    law_name = law_name.replace('\n', ' ').replace('\t', ' ')
+                    law_name = ' '.join(law_name.split())  # 중복 공백 제거
+                    
+                    # 유효한 법령명인지 확인
+                    if any(suffix in law_name for suffix in ['법', '령', '규칙', '규정', '고시', '훈령', '예규', '지침']):
+                        laws.add(law_name)
+        
+        return laws
+
+class LawCollectorAPI:
+    """법령 수집 API 클래스"""
     
     def __init__(self):
         self.law_search_url = "http://www.law.go.kr/DRF/lawSearch.do"
         self.law_detail_url = "http://www.law.go.kr/DRF/lawService.do"
-        self.prec_search_url = "http://www.law.go.kr/DRF/lawPrecSearch.do"
-        self.delay = 0.5  # API 호출 간격
+        self.delay = 0.5
         
     def search_law(self, oc_code: str, law_name: str):
         """법령 검색"""
@@ -75,16 +172,12 @@ class LawCollectorStreamlit:
             response.encoding = 'utf-8'
             
             if response.status_code != 200:
-                st.error(f"API 응답 오류: HTTP {response.status_code}")
                 return []
             
             content = response.text
-            
-            # BOM 제거
             if content.startswith('\ufeff'):
                 content = content[1:]
             
-            # XML 파싱
             root = ET.fromstring(content.encode('utf-8'))
             laws = []
             
@@ -107,11 +200,11 @@ class LawCollectorStreamlit:
             return laws
             
         except Exception as e:
-            st.error(f"검색 중 오류: {str(e)}")
+            st.error(f"검색 오류: {str(e)}")
             return []
     
-    def get_law_detail(self, oc_code: str, law_id: str, law_msn: str, law_name: str):
-        """법령 상세 정보 수집 - 개선된 조문 파싱"""
+    def get_law_detail_with_full_content(self, oc_code: str, law_id: str, law_msn: str, law_name: str):
+        """법령 상세 정보 수집 - 조문, 부칙, 별표 모두 포함"""
         params = {
             'OC': oc_code,
             'target': 'law',
@@ -124,29 +217,26 @@ class LawCollectorStreamlit:
             response = requests.get(
                 self.law_detail_url,
                 params=params,
-                timeout=15,
+                timeout=30,  # 타임아웃 증가
                 verify=False
             )
             response.encoding = 'utf-8'
             
             if response.status_code != 200:
-                st.warning(f"{law_name} 상세 정보 접근 실패 (HTTP {response.status_code})")
-                return self._get_basic_info(law_id, law_name, law_msn)
+                st.warning(f"{law_name} 상세 정보 접근 실패")
+                return None
             
             content = response.text
-            
-            # BOM 제거
             if content.startswith('\ufeff'):
                 content = content[1:]
             
-            # XML 파싱
             try:
                 root = ET.fromstring(content.encode('utf-8'))
-            except ET.ParseError as e:
-                st.warning(f"{law_name} XML 파싱 오류: {str(e)}")
-                return self._get_basic_info(law_id, law_name, law_msn)
+            except ET.ParseError:
+                st.warning(f"{law_name} XML 파싱 오류")
+                return None
             
-            # 법령 정보 추출
+            # 법령 정보 구조
             law_detail = {
                 'law_id': law_id,
                 'law_msn': law_msn,
@@ -154,210 +244,71 @@ class LawCollectorStreamlit:
                 'law_type': '',
                 'promulgation_date': '',
                 'enforcement_date': '',
-                'articles': [],
-                'supplementary_provisions': [],
-                'tables': [],
-                'attachments': [],  # 별표/별첨 추가
-                'hierarchy': {
-                    'upper_laws': [],
-                    'lower_laws': [],
-                    'admin_rules': []
-                }
+                'articles': [],          # 조문
+                'supplementary_provisions': [],  # 부칙
+                'attachments': [],       # 별표/별첨
+                'raw_content': '',       # 전체 원문
             }
             
-            # 기본 정보 추출
+            # 기본 정보
             basic_info = root.find('.//기본정보')
             if basic_info is not None:
                 law_detail['law_type'] = basic_info.findtext('법종구분명', '')
                 law_detail['promulgation_date'] = basic_info.findtext('공포일자', '')
                 law_detail['enforcement_date'] = basic_info.findtext('시행일자', '')
             
-            # 조문 추출 - 여러 가능한 태그 시도
-            articles_found = False
-            
-            # 방법 1: 조문 태그 내부
-            articles_section = root.find('.//조문')
-            if articles_section is not None:
-                # 조문단위 찾기
-                for article_unit in articles_section.findall('.//조문단위'):
-                    article_info = self._extract_article_from_xml(article_unit)
-                    if article_info:
-                        law_detail['articles'].append(article_info)
-                        articles_found = True
-                
-                # 조문내용 직접 찾기 (조문단위가 없는 경우)
-                if not articles_found:
-                    for article_elem in articles_section.findall('.//조문내용'):
-                        article_text = article_elem.text
-                        if article_text:
-                            # 조문 번호 추출 시도
-                            match = re.match(r'제(\d+)조', article_text)
-                            if match:
-                                article_info = {
-                                    'number': f"제{match.group(1)}조",
-                                    'title': '',
-                                    'content': article_text,
-                                    'paragraphs': []
-                                }
-                                law_detail['articles'].append(article_info)
-                                articles_found = True
-            
-            # 방법 2: 전체 XML에서 조문 관련 태그 검색
-            if not articles_found:
-                # 모든 요소를 순회하며 조문 찾기
-                for elem in root.iter():
-                    if elem.tag in ['조문', '조', 'article']:
-                        # 조문번호와 조문내용 찾기
-                        article_num = elem.findtext('조문번호', '')
-                        article_content = elem.findtext('조문내용', '')
-                        
-                        if article_num or article_content:
-                            article_info = {
-                                'number': f"제{article_num}조" if article_num else '',
-                                'title': elem.findtext('조문제목', ''),
-                                'content': article_content or self._extract_text_from_element(elem),
-                                'paragraphs': []
-                            }
-                            if article_info['content']:
-                                law_detail['articles'].append(article_info)
-                                articles_found = True
+            # 전체 조문 추출 - 다양한 방법 시도
+            self._extract_all_articles(root, law_detail)
             
             # 부칙 추출
-            for addendum in root.findall('.//부칙'):
-                addendum_info = {
-                    'number': addendum.findtext('부칙번호', ''),
-                    'promulgation_date': addendum.findtext('부칙공포일자', ''),
-                    'content': self._extract_text_from_element(addendum)
-                }
-                if addendum_info['content']:
-                    law_detail['supplementary_provisions'].append(addendum_info)
+            self._extract_supplementary_provisions(root, law_detail)
             
-            # 별표/별첨 검색
-            for attachment in root.findall('.//별표'):
-                attach_info = {
-                    'type': '별표',
-                    'title': attachment.findtext('별표제목', ''),
-                    'content': self._extract_text_from_element(attachment)
-                }
-                if attach_info['content']:
-                    law_detail['attachments'].append(attach_info)
+            # 별표/별첨 추출
+            self._extract_attachments(root, law_detail)
             
-            # 디버깅 정보
-            if not articles_found:
-                st.info(f"ℹ️ {law_name}의 조문을 찾을 수 없습니다. XML 구조가 다를 수 있습니다.")
-                # XML 구조 확인을 위한 샘플 출력
-                st.text("XML 구조 샘플:")
-                st.text(ET.tostring(root, encoding='unicode')[:500])
+            # 전체 원문 추출 (폴백)
+            if not law_detail['articles']:
+                law_detail['raw_content'] = self._extract_full_text(root)
             
             return law_detail
             
         except Exception as e:
             st.warning(f"{law_name} 수집 중 오류: {str(e)}")
-            return self._get_basic_info(law_id, law_name, law_msn)
+            return None
     
-    def collect_law_hierarchy_improved(self, law_id: str, law_msn: str, oc_code: str, law_name: str):
-        """법령 체계도 수집 - API 기반 개선된 방식"""
-        hierarchy = {
-            'upper_laws': [],
-            'lower_laws': [],  
-            'admin_rules': [],
-            'related_laws': [],
-        }
+    def _extract_all_articles(self, root, law_detail):
+        """모든 조문 추출 - 강화된 버전"""
+        # 방법 1: 조문 태그 직접 찾기
+        articles_section = root.find('.//조문')
+        if articles_section is not None:
+            # 조문단위 찾기
+            for article_unit in articles_section.findall('.//조문단위'):
+                article_info = self._parse_article_unit(article_unit)
+                if article_info:
+                    law_detail['articles'].append(article_info)
         
-        try:
-            # 현재 법령명에서 기본 법령명 추출
-            base_name = law_name
-            
-            # 법령 타입 판별
-            is_enforcement_decree = '시행령' in law_name
-            is_enforcement_rule = '시행규칙' in law_name
-            is_admin_rule = any(k in law_name for k in ['고시', '훈령', '예규', '지침'])
-            
-            # 기본 법령명 추출 (접미사 제거)
-            for suffix in ['시행령', '시행규칙', '고시', '훈령', '예규', '지침']:
-                base_name = base_name.replace(suffix, '').strip()
-            
-            with st.spinner(f"🔍 '{base_name}' 관련 법령 체계 검색 중..."):
-                
-                # 1. 상위법 검색
-                if is_enforcement_decree or is_enforcement_rule or is_admin_rule:
-                    # 기본 법률 검색
-                    results = self.search_law(oc_code, base_name)
-                    for result in results:
-                        if (result['law_name'] == base_name or 
-                            (base_name in result['law_name'] and '법' in result['law_name'] 
-                             and not any(s in result['law_name'] for s in ['시행령', '시행규칙']))):
-                            hierarchy['upper_laws'].append(result)
-                            break
-                    
-                    # 시행규칙인 경우 시행령도 상위법
-                    if is_enforcement_rule:
-                        decree_name = f"{base_name} 시행령"
-                        results = self.search_law(oc_code, decree_name)
-                        for result in results[:1]:
-                            if '시행령' in result['law_name']:
-                                hierarchy['upper_laws'].append(result)
-                
-                # 2. 하위법령 검색
-                if not is_enforcement_rule and not is_admin_rule:
-                    # 시행령 검색
-                    if not is_enforcement_decree:
-                        decree_name = f"{base_name} 시행령"
-                        results = self.search_law(oc_code, decree_name)
-                        for result in results[:2]:
-                            if '시행령' in result['law_name'] and base_name in result['law_name']:
-                                hierarchy['lower_laws'].append(result)
-                    
-                    # 시행규칙 검색
-                    rule_name = f"{base_name} 시행규칙"
-                    results = self.search_law(oc_code, rule_name)
-                    for result in results[:2]:
-                        if '시행규칙' in result['law_name'] and base_name in result['law_name']:
-                            hierarchy['lower_laws'].append(result)
-                
-                # 3. 행정규칙 검색
-                if not is_admin_rule:
-                    admin_types = ['고시', '훈령', '예규', '지침', '규정']
-                    
-                    for admin_type in admin_types:
-                        search_patterns = [
-                            f"{base_name} {admin_type}",
-                            f"{base_name}{admin_type}",
-                        ]
-                        
-                        for pattern in search_patterns:
-                            results = self.search_law(oc_code, pattern)
-                            
-                            for result in results[:3]:
-                                if not any(r['law_id'] == result['law_id'] for r in hierarchy['admin_rules']):
-                                    if admin_type in result['law_name'] and base_name in result['law_name']:
-                                        hierarchy['admin_rules'].append(result)
-                            
-                            if len(hierarchy['admin_rules']) >= 10:
-                                break
-                        
-                        time.sleep(self.delay)
-                
-                # 4. 관련 법령 검색
-                related_keywords = ['특별법', '기본법', '특례법']
-                
-                if len(hierarchy['related_laws']) < 5:
-                    for keyword in related_keywords:
-                        if keyword not in base_name:
-                            search_term = base_name.replace('법', '') + keyword
-                            results = self.search_law(oc_code, search_term)
-                            
-                            for result in results[:1]:
-                                if result['law_id'] != law_id:
-                                    hierarchy['related_laws'].append(result)
-                
-        except Exception as e:
-            st.error(f"법령 체계도 수집 중 오류: {str(e)}")
+        # 방법 2: 조문내용 직접 찾기
+        if not law_detail['articles']:
+            for article_content in root.findall('.//조문내용'):
+                if article_content.text:
+                    article_info = self._parse_article_text(article_content.text)
+                    if article_info:
+                        law_detail['articles'].append(article_info)
         
-        return hierarchy
+        # 방법 3: 전체 요소 순회
+        if not law_detail['articles']:
+            article_elements = []
+            for elem in root.iter():
+                if elem.tag in ['조', '조문', 'article', '조문단위']:
+                    article_elements.append(elem)
+            
+            for elem in article_elements:
+                article_info = self._extract_article_from_element(elem)
+                if article_info and article_info['content']:
+                    law_detail['articles'].append(article_info)
     
-    def _extract_article_from_xml(self, article_elem):
-        """XML 요소에서 조문 정보 추출 - 개선된 버전"""
+    def _parse_article_unit(self, article_elem):
+        """조문단위 파싱"""
         article_info = {
             'number': '',
             'title': '',
@@ -365,92 +316,185 @@ class LawCollectorStreamlit:
             'paragraphs': []
         }
         
-        # 조문번호 추출 - 여러 가능한 태그 시도
-        article_num = (article_elem.findtext('조문번호', '') or 
-                      article_elem.findtext('조번호', '') or
-                      article_elem.findtext('조', ''))
-        
+        # 조문번호
+        article_num = article_elem.findtext('조문번호', '')
         if article_num:
-            # 숫자만 추출
-            num_match = re.search(r'\d+', article_num)
-            if num_match:
-                article_info['number'] = f"제{num_match.group()}조"
-            else:
-                article_info['number'] = f"제{article_num}조"
+            article_info['number'] = f"제{article_num}조"
         
-        # 조문제목 추출
-        article_info['title'] = (article_elem.findtext('조문제목', '') or
-                                article_elem.findtext('조제목', ''))
+        # 조문제목
+        article_info['title'] = article_elem.findtext('조문제목', '')
         
-        # 조문내용 추출 - 여러 방법 시도
+        # 조문내용
         article_content = article_elem.findtext('조문내용', '')
         if not article_content:
-            article_content = article_elem.findtext('조내용', '')
-        if not article_content:
-            # 모든 텍스트 추출
-            article_content = self._extract_text_from_element(article_elem)
+            # 전체 텍스트 추출
+            article_content = self._get_all_text(article_elem)
         
         article_info['content'] = article_content
         
         # 항 추출
-        for para_elem in article_elem.findall('.//항'):
-            para_num = para_elem.findtext('항번호', '')
-            para_content = para_elem.findtext('항내용', '')
-            if para_num and para_content:
-                article_info['paragraphs'].append({
-                    'number': para_num,
-                    'content': para_content
-                })
+        for para in article_elem.findall('.//항'):
+            para_info = {
+                'number': para.findtext('항번호', ''),
+                'content': para.findtext('항내용', '')
+            }
+            if para_info['content']:
+                article_info['paragraphs'].append(para_info)
         
-        # 조문 번호가 없어도 내용이 있으면 반환
         return article_info if (article_info['number'] or article_info['content']) else None
     
-    def _extract_text_from_element(self, elem):
-        """XML 요소에서 텍스트 추출 - 개선된 버전"""
+    def _parse_article_text(self, text):
+        """조문 텍스트 파싱"""
+        # 제1조, 제2조 등의 패턴 찾기
+        pattern = r'(제\d+조(?:의\d+)?)\s*(?:\((.*?)\))?\s*(.*?)(?=제\d+조|$)'
+        matches = re.findall(pattern, text, re.DOTALL)
+        
+        articles = []
+        for match in matches:
+            article_info = {
+                'number': match[0],
+                'title': match[1],
+                'content': match[2].strip(),
+                'paragraphs': []
+            }
+            
+            # 항 분리 (①, ②, ... 패턴)
+            para_pattern = r'([①②③④⑤⑥⑦⑧⑨⑩]+)\s*(.*?)(?=[①②③④⑤⑥⑦⑧⑨⑩]|$)'
+            para_matches = re.findall(para_pattern, article_info['content'], re.DOTALL)
+            
+            for para_match in para_matches:
+                article_info['paragraphs'].append({
+                    'number': para_match[0],
+                    'content': para_match[1].strip()
+                })
+            
+            articles.append(article_info)
+        
+        return articles[0] if articles else None
+    
+    def _extract_article_from_element(self, elem):
+        """요소에서 조문 정보 추출"""
+        article_info = {
+            'number': '',
+            'title': '',
+            'content': '',
+            'paragraphs': []
+        }
+        
+        # 조문번호 찾기
+        for tag in ['조문번호', '조번호', '번호']:
+            num = elem.findtext(tag, '')
+            if num:
+                article_info['number'] = f"제{num}조" if not num.startswith('제') else num
+                break
+        
+        # 조문제목 찾기
+        for tag in ['조문제목', '조제목', '제목']:
+            title = elem.findtext(tag, '')
+            if title:
+                article_info['title'] = title
+                break
+        
+        # 조문내용 찾기
+        for tag in ['조문내용', '조내용', '내용']:
+            content = elem.findtext(tag, '')
+            if content:
+                article_info['content'] = content
+                break
+        
+        # 내용이 없으면 전체 텍스트
+        if not article_info['content']:
+            article_info['content'] = self._get_all_text(elem)
+        
+        return article_info
+    
+    def _extract_supplementary_provisions(self, root, law_detail):
+        """부칙 추출"""
+        # 부칙 태그 찾기
+        for addendum in root.findall('.//부칙'):
+            addendum_info = {
+                'number': addendum.findtext('부칙번호', ''),
+                'promulgation_date': addendum.findtext('부칙공포일자', ''),
+                'content': self._get_all_text(addendum)
+            }
+            if addendum_info['content']:
+                law_detail['supplementary_provisions'].append(addendum_info)
+        
+        # 부칙내용 직접 찾기
+        if not law_detail['supplementary_provisions']:
+            for elem in root.iter():
+                if elem.tag == '부칙내용' and elem.text:
+                    law_detail['supplementary_provisions'].append({
+                        'number': '',
+                        'promulgation_date': '',
+                        'content': elem.text
+                    })
+    
+    def _extract_attachments(self, root, law_detail):
+        """별표/별첨 추출"""
+        # 별표 찾기
+        for table in root.findall('.//별표'):
+            table_info = {
+                'type': '별표',
+                'number': table.findtext('별표번호', ''),
+                'title': table.findtext('별표제목', ''),
+                'content': self._get_all_text(table)
+            }
+            if table_info['content'] or table_info['title']:
+                law_detail['attachments'].append(table_info)
+        
+        # 별지 찾기
+        for form in root.findall('.//별지'):
+            form_info = {
+                'type': '별지',
+                'number': form.findtext('별지번호', ''),
+                'title': form.findtext('별지제목', ''),
+                'content': self._get_all_text(form)
+            }
+            if form_info['content'] or form_info['title']:
+                law_detail['attachments'].append(form_info)
+        
+        # 서식 찾기
+        for format_elem in root.findall('.//서식'):
+            format_info = {
+                'type': '서식',
+                'number': format_elem.findtext('서식번호', ''),
+                'title': format_elem.findtext('서식제목', ''),
+                'content': self._get_all_text(format_elem)
+            }
+            if format_info['content'] or format_info['title']:
+                law_detail['attachments'].append(format_info)
+    
+    def _extract_full_text(self, root):
+        """전체 텍스트 추출 (폴백)"""
+        return self._get_all_text(root)
+    
+    def _get_all_text(self, elem):
+        """요소의 모든 텍스트 추출"""
         texts = []
         
         # 현재 요소의 텍스트
         if elem.text and elem.text.strip():
             texts.append(elem.text.strip())
         
-        # 자식 요소들의 텍스트
+        # 모든 자식 요소의 텍스트
         for child in elem:
-            child_text = self._extract_text_from_element(child)
+            child_text = self._get_all_text(child)
             if child_text:
                 texts.append(child_text)
             
-            # tail 텍스트 (요소 뒤의 텍스트)
+            # tail 텍스트
             if child.tail and child.tail.strip():
                 texts.append(child.tail.strip())
         
         return ' '.join(texts)
     
-    def _get_basic_info(self, law_id: str, law_name: str, law_msn: str = ''):
-        """기본 정보만 반환"""
-        return {
-            'law_id': law_id,
-            'law_msn': law_msn,
-            'law_name': law_name,
-            'law_type': '',
-            'promulgation_date': '',
-            'enforcement_date': '',
-            'articles': [],
-            'supplementary_provisions': [],
-            'tables': [],
-            'attachments': [],
-            'hierarchy': {
-                'upper_laws': [],
-                'lower_laws': [],
-                'admin_rules': []
-            }
-        }
-    
-    def export_laws_to_zip(self, laws_dict: dict) -> bytes:
-        """선택된 법령들을 ZIP 파일로 압축"""
+    def export_to_zip(self, laws_dict):
+        """수집된 법령을 ZIP으로 내보내기"""
         zip_buffer = BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 전체 JSON 데이터
+            # 전체 JSON
             all_data = {
                 'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'total_laws': len(laws_dict),
@@ -466,70 +510,79 @@ class LawCollectorStreamlit:
             for law_id, law in laws_dict.items():
                 safe_name = re.sub(r'[\\/*?:"<>|]', '_', law['law_name'])
                 
-                # JSON 파일
+                # JSON
                 zip_file.writestr(
                     f'laws/{safe_name}.json',
                     json.dumps(law, ensure_ascii=False, indent=2)
                 )
                 
-                # 텍스트 파일 (조문 포함)
-                text_content = self._format_law_as_text(law)
+                # 텍스트 (전체 내용 포함)
+                text_content = self._format_law_full_text(law)
                 zip_file.writestr(
                     f'laws/{safe_name}.txt',
                     text_content
                 )
             
-            # README 파일
-            readme_content = self._create_readme(laws_dict)
-            zip_file.writestr('README.md', readme_content)
+            # README
+            readme = self._create_readme(laws_dict)
+            zip_file.writestr('README.md', readme)
         
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
     
-    def _format_law_as_text(self, law: dict) -> str:
-        """법령을 텍스트 형식으로 변환 - 조문 포함"""
+    def _format_law_full_text(self, law):
+        """법령 전체 내용을 텍스트로 포맷"""
         lines = []
         
-        lines.append(f"{'=' * 60}")
-        lines.append(f"{law['law_name']}")
-        lines.append(f"{'=' * 60}")
+        # 헤더
+        lines.append(f"{'=' * 80}")
+        lines.append(f"법령명: {law['law_name']}")
         lines.append(f"법종구분: {law.get('law_type', '')}")
         lines.append(f"공포일자: {law.get('promulgation_date', '')}")
         lines.append(f"시행일자: {law.get('enforcement_date', '')}")
-        lines.append(f"{'=' * 60}\n")
+        lines.append(f"{'=' * 80}\n")
         
         # 조문
         if law.get('articles'):
-            lines.append("【조문】\n")
+            lines.append("【 조 문 】\n")
             for article in law['articles']:
-                lines.append(f"\n{article['number']} {article['title']}")
-                lines.append(f"{article['content']}\n")
+                lines.append(f"\n{article['number']} {article.get('title', '')}")
+                lines.append(article['content'])
                 
                 # 항
                 if article.get('paragraphs'):
-                    for idx, para in enumerate(article['paragraphs'], 1):
-                        lines.append(f"  ② {para['content']}")
-        else:
-            lines.append("【조문】\n조문 정보가 없습니다.\n")
+                    for para in article['paragraphs']:
+                        lines.append(f"\n  {para['number']} {para['content']}")
+                
+                lines.append("")  # 조문 간 공백
         
         # 부칙
         if law.get('supplementary_provisions'):
-            lines.append("\n\n【부칙】\n")
-            for supp in law['supplementary_provisions']:
-                lines.append(f"\n부칙 <{supp['promulgation_date']}>")
+            lines.append("\n\n【 부 칙 】\n")
+            for idx, supp in enumerate(law['supplementary_provisions'], 1):
+                if supp.get('promulgation_date'):
+                    lines.append(f"\n부칙 <{supp['promulgation_date']}>")
+                else:
+                    lines.append(f"\n부칙 {idx}")
                 lines.append(supp['content'])
         
         # 별표/별첨
         if law.get('attachments'):
-            lines.append("\n\n【별표/별첨】\n")
+            lines.append("\n\n【 별표/별첨 】\n")
             for attach in law['attachments']:
-                lines.append(f"\n[{attach['type']}] {attach['title']}")
+                lines.append(f"\n[{attach['type']}] {attach.get('title', '')}")
                 lines.append(attach['content'])
+                lines.append("")
+        
+        # 원문 (조문이 없는 경우)
+        if not law.get('articles') and law.get('raw_content'):
+            lines.append("\n\n【 원 문 】\n")
+            lines.append(law['raw_content'])
         
         return '\n'.join(lines)
     
-    def _create_readme(self, laws_dict: dict) -> str:
-        """README 파일 생성"""
+    def _create_readme(self, laws_dict):
+        """README 생성"""
         content = f"""# 법령 수집 결과
 
 수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -540,171 +593,44 @@ class LawCollectorStreamlit:
 - `all_laws.json`: 전체 법령 데이터 (JSON)
 - `laws/`: 개별 법령 파일 디렉토리
   - `*.json`: 법령별 상세 데이터
-  - `*.txt`: 법령별 텍스트 형식 (조문 포함)
+  - `*.txt`: 법령별 전체 텍스트 (조문, 부칙, 별표 포함)
 - `README.md`: 이 파일
 
-## 📊 수집된 법령 목록
+## 📊 수집 통계
 
 """
-        # 법령별 요약
+        # 통계
+        total_articles = 0
+        total_provisions = 0
+        total_attachments = 0
+        
+        for law in laws_dict.values():
+            total_articles += len(law.get('articles', []))
+            total_provisions += len(law.get('supplementary_provisions', []))
+            total_attachments += len(law.get('attachments', []))
+        
+        content += f"- 총 조문 수: {total_articles:,}개\n"
+        content += f"- 총 부칙 수: {total_provisions}개\n"
+        content += f"- 총 별표/별첨 수: {total_attachments}개\n"
+        
+        content += "\n## 📖 수집된 법령 목록\n\n"
+        
         for law_id, law in laws_dict.items():
             article_count = len(law.get('articles', []))
-            content += f"### {law['law_name']} ({law.get('law_type', '')})\n"
+            content += f"### {law['law_name']}\n"
+            content += f"- 법종구분: {law.get('law_type', '')}\n"
             content += f"- 시행일자: {law.get('enforcement_date', '')}\n"
-            content += f"- 조문 수: {article_count}개\n"
-            content += f"- 부칙 수: {len(law.get('supplementary_provisions', []))}개\n"
-            content += f"- 별표/별첨 수: {len(law.get('attachments', []))}개\n\n"
+            content += f"- 조문: {article_count}개\n"
+            content += f"- 부칙: {len(law.get('supplementary_provisions', []))}개\n"
+            content += f"- 별표/별첨: {len(law.get('attachments', []))}개\n\n"
         
         return content
 
 
-def generate_markdown_report(collected_laws, collected_hierarchy, collected_precs):
-    """마크다운 보고서 생성 - 조문 내용 포함"""
-    md_content = []
-    md_content.append(f"# 법령 및 판례 수집 결과\n")
-    md_content.append(f"수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-    
-    # 수집 요약
-    md_content.append(f"\n## 📊 수집 요약\n")
-    
-    # 주 법령과 관련 법령 구분
-    main_law_ids = set()
-    related_law_ids = set()
-    
-    # 체계도 정보가 있는 법령을 주 법령으로 분류
-    for law_id in collected_hierarchy.keys():
-        main_law_ids.add(law_id)
-        hierarchy = collected_hierarchy[law_id]
-        for category in ['upper_laws', 'lower_laws', 'admin_rules']:
-            for related_law in hierarchy.get(category, []):
-                if related_law.get('law_id'):
-                    related_law_ids.add(related_law['law_id'])
-    
-    # 체계도 정보가 없어도 수집된 법령이 있으면 주 법령으로 추가
-    if not main_law_ids and collected_laws:
-        main_law_ids = set(collected_laws.keys())
-    
-    md_content.append(f"- 주 법령: {len(main_law_ids)}개\n")
-    md_content.append(f"- 관련 법령: {len(related_law_ids)}개\n")
-    md_content.append(f"- 총 법령 수: {len(collected_laws)}개\n")
-    md_content.append(f"- 총 판례 수: {len(collected_precs)}개\n")
-    
-    # 법령별 체계도
-    if collected_hierarchy:
-        md_content.append(f"\n## 🌳 법령 체계도\n")
-        
-        for law_id, hierarchy in collected_hierarchy.items():
-            if law_id in collected_laws:
-                law = collected_laws[law_id]
-                md_content.append(f"\n### 📋 {law['law_name']} 체계도\n")
-                
-                # 체계도 시각화
-                md_content.append("```")
-                md_content.append(f"         [{law['law_name']}]")
-                md_content.append(f"              |")
-                
-                # 상위법
-                if hierarchy.get('upper_laws'):
-                    md_content.append(f"      상위법 ↑")
-                    for upper in hierarchy['upper_laws'][:3]:
-                        md_content.append(f"    • {upper['law_name']}")
-                
-                # 하위법령
-                if hierarchy.get('lower_laws'):
-                    md_content.append(f"              |")
-                    md_content.append(f"      하위법령 ↓")
-                    for lower in hierarchy['lower_laws'][:5]:
-                        md_content.append(f"    • {lower['law_name']}")
-                
-                # 행정규칙
-                if hierarchy.get('admin_rules'):
-                    md_content.append(f"              |")
-                    md_content.append(f"     행정규칙 ↓")
-                    for admin in hierarchy['admin_rules'][:5]:
-                        md_content.append(f"    • {admin['law_name']}")
-                
-                md_content.append("```\n")
-    
-    # 상세 법령 정보
-    md_content.append(f"\n## 📖 법령 상세 정보\n")
-    
-    # 주 법령 먼저
-    if main_law_ids:
-        md_content.append(f"\n### 주 법령\n")
-        for law_id in main_law_ids:
-            if law_id in collected_laws:
-                law = collected_laws[law_id]
-                md_content.append(f"\n#### {law['law_name']}\n")
-                md_content.append(f"- 법령 ID: {law_id}\n")
-                md_content.append(f"- 법종구분: {law.get('law_type', '')}\n")
-                md_content.append(f"- 공포일자: {law.get('promulgation_date', '')}\n")
-                md_content.append(f"- 시행일자: {law.get('enforcement_date', '')}\n")
-                
-                # 조문 정보
-                if law.get('articles'):
-                    md_content.append(f"- 조문 수: {len(law['articles'])}개\n")
-                    md_content.append(f"\n##### 주요 조문\n")
-                    
-                    # 처음 5개 조문만 표시
-                    for article in law['articles'][:5]:
-                        md_content.append(f"\n###### {article['number']} {article['title']}\n")
-                        # 조문 내용 (최대 300자)
-                        content = article['content']
-                        if len(content) > 300:
-                            content = content[:300] + '...'
-                        md_content.append(f"{content}\n")
-                else:
-                    md_content.append("- 조문 정보가 없습니다.\n")
-                
-                # 별표/별첨 정보
-                if law.get('attachments'):
-                    md_content.append(f"\n##### 별표/별첨\n")
-                    for attach in law['attachments'][:3]:
-                        md_content.append(f"- [{attach['type']}] {attach['title']}\n")
-    
-    # 관련 법령
-    if related_law_ids:
-        md_content.append(f"\n### 관련 법령\n")
-        for law_id in related_law_ids:
-            if law_id in collected_laws:
-                law = collected_laws[law_id]
-                md_content.append(f"\n#### {law['law_name']}\n")
-                md_content.append(f"- 법종구분: {law.get('law_type', '')}\n")
-                md_content.append(f"- 시행일자: {law.get('enforcement_date', '')}\n")
-                md_content.append(f"- 조문 수: {len(law.get('articles', []))}개\n")
-    
-    # 통계 정보
-    md_content.append(f"\n## 📈 통계 정보\n")
-    
-    # 법령 타입별 분류
-    law_types = {}
-    for law in collected_laws.values():
-        law_type = law.get('law_type', '기타')
-        if law_type:
-            law_types[law_type] = law_types.get(law_type, 0) + 1
-    
-    if law_types:
-        md_content.append(f"\n### 법령 타입별 분류\n")
-        for law_type, count in sorted(law_types.items(), key=lambda x: x[1], reverse=True):
-            md_content.append(f"- {law_type}: {count}개\n")
-    
-    # 총 조문 수
-    total_articles = sum(len(law.get('articles', [])) for law in collected_laws.values())
-    total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in collected_laws.values())
-    total_attachments = sum(len(law.get('attachments', [])) for law in collected_laws.values())
-    
-    md_content.append(f"\n### 수집 내용 통계\n")
-    md_content.append(f"- 총 조문 수: {total_articles:,}개\n")
-    md_content.append(f"- 총 부칙 수: {total_provisions}개\n")
-    md_content.append(f"- 총 별표/별첨 수: {total_attachments}개\n")
-    
-    return '\n'.join(md_content)
-
-
 # 메인 UI
 def main():
-    st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구")
+    st.title("📚 법제처 법령 수집기 - 파일 업로드 방식")
+    st.markdown("법령체계도 파일을 업로드하여 법령을 수집합니다")
     
     # 사이드바
     with st.sidebar:
@@ -717,62 +643,142 @@ def main():
             help="예: test@korea.kr → test"
         )
         
-        # 법령명 입력
-        law_name = st.text_input(
-            "법령명",
-            placeholder="예: 민법, 상법, 형법",
-            help="검색할 법령명을 입력하세요"
+        st.divider()
+        
+        # 파일 업로드
+        st.subheader("📄 법령체계도 파일 업로드")
+        uploaded_file = st.file_uploader(
+            "파일 선택",
+            type=['pdf', 'xlsx', 'xls', 'md', 'txt'],
+            help="PDF, Excel, Markdown, 텍스트 파일을 지원합니다"
         )
         
-        # 버튼
-        col1, col2 = st.columns(2)
-        with col1:
-            search_btn = st.button("🔍 검색", type="primary", use_container_width=True)
-        with col2:
-            reset_btn = st.button("🔄 초기화", type="secondary", use_container_width=True)
+        if uploaded_file:
+            st.success(f"✅ {uploaded_file.name} 업로드됨")
             
-        if reset_btn:
-            # 세션 상태 초기화
-            st.session_state.search_results = []
-            st.session_state.selected_laws = []
-            st.session_state.hierarchy_laws = []
-            st.session_state.selected_hierarchy_laws = []
-            st.session_state.collected_laws = {}
-            st.session_state.collected_hierarchy = {}
+            # 파일 타입 표시
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            st.info(f"파일 형식: {file_type.upper()}")
+        
+        # 초기화 버튼
+        if st.button("🔄 초기화", type="secondary", use_container_width=True):
+            for key in st.session_state:
+                del st.session_state[key]
             st.experimental_rerun()
     
     # 메인 컨텐츠
-    collector = LawCollectorStreamlit()
+    extractor = LawFileExtractor()
+    collector = LawCollectorAPI()
     
-    # STEP 1: 법령 검색
-    if search_btn:
-        if not oc_code:
-            st.error("기관코드를 입력해주세요!")
-        elif not law_name:
-            st.error("법령명을 입력해주세요!")
-        else:
-            with st.spinner(f"'{law_name}' 검색 중..."):
-                results = collector.search_law(oc_code, law_name)
-                
-                if results:
-                    st.success(f"{len(results)}개의 법령을 찾았습니다!")
-                    st.session_state.search_results = results
-                else:
-                    st.warning("검색 결과가 없습니다.")
-                    st.session_state.search_results = []
-    
-    # STEP 2: 검색 결과에서 법령 선택
-    if st.session_state.search_results:
-        st.header("📋 STEP 1: 법령 선택")
-        st.info("체계도를 확인할 법령을 선택하세요")
+    # STEP 1: 파일에서 법령 추출
+    if uploaded_file and not st.session_state.file_processed:
+        st.header("📋 STEP 1: 법령명 추출")
         
-        # 전체 선택/해제
-        col1, col2 = st.columns([3, 1])
-        with col2:
-            select_all = st.checkbox("전체 선택", key="select_all_main")
+        with st.spinner("파일에서 법령명을 추출하는 중..."):
+            file_type = uploaded_file.name.split('.')[-1].lower()
+            
+            # 파일 타입별 처리
+            if file_type == 'pdf':
+                extracted_laws = extractor.extract_from_pdf(uploaded_file)
+            elif file_type in ['xlsx', 'xls']:
+                extracted_laws = extractor.extract_from_excel(uploaded_file)
+            elif file_type == 'md':
+                extracted_laws = extractor.extract_from_markdown(uploaded_file)
+            elif file_type == 'txt':
+                extracted_laws = extractor.extract_from_text(uploaded_file)
+            else:
+                st.error("지원하지 않는 파일 형식입니다")
+                extracted_laws = []
+            
+            if extracted_laws:
+                st.success(f"✅ {len(extracted_laws)}개의 법령명을 찾았습니다!")
+                st.session_state.extracted_laws = extracted_laws
+                st.session_state.file_processed = True
+            else:
+                st.warning("파일에서 법령명을 찾을 수 없습니다")
+    
+    # STEP 2: 추출된 법령 표시 및 편집
+    if st.session_state.extracted_laws:
+        st.header("✏️ STEP 2: 법령명 확인 및 편집")
+        st.info("추출된 법령명을 확인하고 필요시 수정하거나 추가할 수 있습니다")
+        
+        # 법령명 편집 영역
+        edited_laws = []
+        
+        # 기존 법령명 표시
+        st.subheader("추출된 법령명")
+        for idx, law_name in enumerate(st.session_state.extracted_laws):
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                edited_name = st.text_input(
+                    f"법령 {idx+1}",
+                    value=law_name,
+                    key=f"edit_{idx}"
+                )
+                if edited_name:
+                    edited_laws.append(edited_name)
+            with col2:
+                if st.button("삭제", key=f"del_{idx}"):
+                    st.session_state.extracted_laws.pop(idx)
+                    st.experimental_rerun()
+        
+        # 법령명 추가
+        st.subheader("법령명 추가")
+        new_law = st.text_input("새 법령명 입력", key="new_law_input")
+        if st.button("➕ 추가") and new_law:
+            st.session_state.extracted_laws.append(new_law)
+            st.experimental_rerun()
+        
+        # 법령 검색 버튼
+        if st.button("🔍 법령 검색", type="primary", use_container_width=True):
+            if not oc_code:
+                st.error("기관코드를 입력해주세요!")
+            else:
+                # 검색 시작
+                search_results = []
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # 수정된 법령명으로 업데이트
+                if edited_laws:
+                    st.session_state.extracted_laws = edited_laws
+                
+                total = len(st.session_state.extracted_laws)
+                
+                for idx, law_name in enumerate(st.session_state.extracted_laws):
+                    progress = (idx + 1) / total
+                    progress_bar.progress(progress)
+                    status_text.text(f"검색 중: {law_name}")
+                    
+                    # API 검색
+                    results = collector.search_law(oc_code, law_name)
+                    
+                    for result in results:
+                        # 검색어와 유사한 결과만 포함
+                        if law_name in result['law_name'] or result['law_name'] in law_name:
+                            result['search_query'] = law_name
+                            search_results.append(result)
+                    
+                    time.sleep(collector.delay)
+                
+                progress_bar.progress(1.0)
+                status_text.text("검색 완료!")
+                
+                if search_results:
+                    st.success(f"✅ 총 {len(search_results)}개의 법령을 찾았습니다!")
+                    st.session_state.search_results = search_results
+                else:
+                    st.warning("검색 결과가 없습니다")
+    
+    # STEP 3: 검색 결과에서 선택
+    if st.session_state.search_results:
+        st.header("📑 STEP 3: 수집할 법령 선택")
+        
+        # 전체 선택
+        select_all = st.checkbox("전체 선택", key="select_all_results")
         
         # 테이블 헤더
-        col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+        col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
         with col1:
             st.markdown("**선택**")
         with col2:
@@ -781,29 +787,33 @@ def main():
             st.markdown("**법종구분**")
         with col4:
             st.markdown("**시행일자**")
+        with col5:
+            st.markdown("**검색어**")
         
         st.divider()
         
-        # 선택된 법령 추적
+        # 선택된 법령
         selected_indices = []
         
-        # 각 법령에 대한 체크박스
-        for i, law in enumerate(st.session_state.search_results):
-            col1, col2, col3, col4 = st.columns([1, 3, 2, 2])
+        for idx, law in enumerate(st.session_state.search_results):
+            col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
             
             with col1:
-                is_selected = st.checkbox("", key=f"select_{i}", value=select_all)
+                is_selected = st.checkbox("", key=f"sel_{idx}", value=select_all)
                 if is_selected:
-                    selected_indices.append(i)
+                    selected_indices.append(idx)
             
             with col2:
                 st.write(law['law_name'])
             
             with col3:
-                st.write(law['law_type'])
+                st.write(law.get('law_type', ''))
             
             with col4:
-                st.write(law['enforcement_date'])
+                st.write(law.get('enforcement_date', ''))
+            
+            with col5:
+                st.write(law.get('search_query', ''))
         
         # 선택된 법령 저장
         st.session_state.selected_laws = [
@@ -811,200 +821,66 @@ def main():
         ]
         
         if st.session_state.selected_laws:
-            st.success(f"{len(st.session_state.selected_laws)}개 법령이 선택되었습니다.")
+            st.success(f"{len(st.session_state.selected_laws)}개 법령이 선택되었습니다")
             
-            # 체계도 검색 버튼
-            if st.button("🌳 법령 체계도 검색", type="primary", use_container_width=True):
-                # 체계도 수집
-                all_hierarchy_laws = []
-                
+            # 수집 버튼
+            if st.button("📥 선택한 법령 수집", type="primary", use_container_width=True):
+                collected_laws = {}
                 progress_bar = st.progress(0)
                 status_text = st.empty()
                 
+                total = len(st.session_state.selected_laws)
+                success_count = 0
+                
                 for idx, law in enumerate(st.session_state.selected_laws):
-                    progress = (idx + 1) / len(st.session_state.selected_laws)
+                    progress = (idx + 1) / total
                     progress_bar.progress(progress)
-                    status_text.text(f"체계도 검색 중: {law['law_name']}...")
+                    status_text.text(f"수집 중 ({idx + 1}/{total}): {law['law_name']}")
                     
-                    # 체계도 수집
-                    hierarchy = collector.collect_law_hierarchy_improved(
+                    # 상세 정보 수집
+                    law_detail = collector.get_law_detail_with_full_content(
+                        oc_code,
                         law['law_id'],
                         law.get('law_msn', ''),
-                        oc_code,
                         law['law_name']
                     )
                     
-                    # 체계도 정보 저장 (중요!)
-                    st.session_state.collected_hierarchy[law['law_id']] = hierarchy
-                    
-                    # 체계도의 모든 법령을 하나의 리스트로 모음
-                    for category in ['upper_laws', 'lower_laws', 'admin_rules', 'related_laws']:
-                        for h_law in hierarchy.get(category, []):
-                            # 중복 제거
-                            if not any(l['law_id'] == h_law['law_id'] for l in all_hierarchy_laws):
-                                h_law['main_law'] = law['law_name']
-                                h_law['category'] = category
-                                all_hierarchy_laws.append(h_law)
-                    
-                    # 주 법령도 추가
-                    law['main_law'] = law['law_name']
-                    law['category'] = 'main'
-                    all_hierarchy_laws.append(law)
+                    if law_detail:
+                        collected_laws[law['law_id']] = law_detail
+                        success_count += 1
                     
                     time.sleep(collector.delay)
                 
                 progress_bar.progress(1.0)
-                status_text.text("체계도 검색 완료!")
+                status_text.text(f"수집 완료! (성공: {success_count}/{total})")
                 
-                st.session_state.hierarchy_laws = all_hierarchy_laws
+                st.session_state.collected_laws = collected_laws
                 
-                # 체계도 요약 표시
-                st.info(f"📊 체계도 검색 결과: 총 {len(all_hierarchy_laws)}개 법령 발견")
+                # 통계 표시
+                total_articles = sum(len(law.get('articles', [])) for law in collected_laws.values())
+                total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in collected_laws.values())
+                total_attachments = sum(len(law.get('attachments', [])) for law in collected_laws.values())
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("총 조문", f"{total_articles:,}개")
+                with col2:
+                    st.metric("총 부칙", f"{total_provisions}개")
+                with col3:
+                    st.metric("총 별표/별첨", f"{total_attachments}개")
     
-    # STEP 3: 체계도 법령 선택
-    if st.session_state.hierarchy_laws:
-        st.header("🌳 STEP 2: 체계도 법령 선택")
-        st.info("수집할 법령을 선택하세요")
-        
-        # 카테고리별 분류
-        categories = {
-            'main': '주 법령',
-            'upper_laws': '상위법',
-            'lower_laws': '하위법령',
-            'admin_rules': '행정규칙',
-            'related_laws': '관련법령'
-        }
-        
-        # 카테고리별 탭
-        tabs = st.tabs(list(categories.values()))
-        
-        selected_hierarchy_indices = []
-        
-        for tab_idx, (category_key, category_name) in enumerate(categories.items()):
-            with tabs[tab_idx]:
-                # 해당 카테고리의 법령들
-                category_laws = [
-                    (idx, law) for idx, law in enumerate(st.session_state.hierarchy_laws)
-                    if law.get('category') == category_key
-                ]
-                
-                if category_laws:
-                    # 전체 선택
-                    select_all_cat = st.checkbox(f"전체 선택", key=f"select_all_{category_key}")
-                    
-                    # 테이블 헤더
-                    col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
-                    with col1:
-                        st.markdown("**선택**")
-                    with col2:
-                        st.markdown("**법령명**")
-                    with col3:
-                        st.markdown("**법종구분**")
-                    with col4:
-                        st.markdown("**시행일자**")
-                    with col5:
-                        st.markdown("**관련 주 법령**")
-                    
-                    st.divider()
-                    
-                    # 각 법령 표시
-                    for idx, law in category_laws:
-                        col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 2, 2])
-                        
-                        with col1:
-                            is_selected = st.checkbox(
-                                "", 
-                                key=f"h_select_{idx}", 
-                                value=select_all_cat
-                            )
-                            if is_selected:
-                                selected_hierarchy_indices.append(idx)
-                        
-                        with col2:
-                            st.write(law['law_name'])
-                        
-                        with col3:
-                            st.write(law.get('law_type', ''))
-                        
-                        with col4:
-                            st.write(law.get('enforcement_date', ''))
-                        
-                        with col5:
-                            st.write(law.get('main_law', ''))
-                else:
-                    st.info(f"{category_name}이 없습니다.")
-        
-        # 선택된 법령 저장
-        st.session_state.selected_hierarchy_laws = [
-            st.session_state.hierarchy_laws[i] for i in set(selected_hierarchy_indices)
-        ]
-        
-        if st.session_state.selected_hierarchy_laws:
-            st.success(f"총 {len(st.session_state.selected_hierarchy_laws)}개 법령이 선택되었습니다.")
-            
-            # 수집 및 다운로드 버튼
-            col1, col2 = st.columns(2)
-            with col1:
-                collect_btn = st.button("📥 선택한 법령 수집", type="primary", use_container_width=True)
-            with col2:
-                if st.session_state.collected_laws:
-                    download_ready = st.button("💾 다운로드 준비됨", type="secondary", use_container_width=True)
-    
-    # STEP 4: 법령 수집
-    if 'collect_btn' in locals() and collect_btn:
-        if st.session_state.selected_hierarchy_laws:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            # 수집 시작
-            collected_laws = {}
-            total = len(st.session_state.selected_hierarchy_laws)
-            
-            for idx, law in enumerate(st.session_state.selected_hierarchy_laws):
-                progress = (idx + 1) / total
-                progress_bar.progress(progress)
-                status_text.text(f"수집 중 ({idx + 1}/{total}): {law['law_name']}...")
-                
-                # 법령 상세 정보 수집
-                law_detail = collector.get_law_detail(
-                    oc_code,
-                    law['law_id'],
-                    law.get('law_msn', ''),
-                    law['law_name']
-                )
-                
-                if law_detail:
-                    collected_laws[law['law_id']] = law_detail
-                    
-                    # 체계도 정보 추가
-                    if law['law_id'] in st.session_state.collected_hierarchy:
-                        law_detail['hierarchy'] = st.session_state.collected_hierarchy[law['law_id']]
-                
-                time.sleep(collector.delay)
-            
-            progress_bar.progress(1.0)
-            status_text.text("수집 완료!")
-            
-            st.session_state.collected_laws = collected_laws
-            st.success(f"✅ {len(collected_laws)}개 법령 수집 완료!")
-            
-            # 수집 결과 요약
-            total_articles = sum(len(law.get('articles', [])) for law in collected_laws.values())
-            total_attachments = sum(len(law.get('attachments', [])) for law in collected_laws.values())
-            st.info(f"📊 총 {total_articles}개 조문, {total_attachments}개 별표/별첨 수집")
-    
-    # STEP 5: 다운로드
+    # STEP 4: 다운로드
     if st.session_state.collected_laws:
-        st.header("💾 STEP 3: 다운로드")
+        st.header("💾 STEP 4: 다운로드")
         
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         
         with col1:
             # JSON 다운로드
             json_data = {
                 'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'laws': st.session_state.collected_laws,
-                'hierarchy': st.session_state.collected_hierarchy
+                'source_file': uploaded_file.name if uploaded_file else 'unknown',
+                'laws': st.session_state.collected_laws
             }
             json_str = json.dumps(json_data, ensure_ascii=False, indent=2)
             
@@ -1017,39 +893,35 @@ def main():
             )
         
         with col2:
-            # ZIP 다운로드 (조문 포함)
-            zip_data = collector.export_laws_to_zip(st.session_state.collected_laws)
+            # ZIP 다운로드
+            zip_data = collector.export_to_zip(st.session_state.collected_laws)
             
             st.download_button(
-                label="📦 ZIP 다운로드",
+                label="📦 ZIP 다운로드 (전체 내용)",
                 data=zip_data,
                 file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
                 mime="application/zip",
                 use_container_width=True
             )
         
-        with col3:
-            # 마크다운 다운로드 (조문 요약 포함)
-            md_content = generate_markdown_report(
-                st.session_state.collected_laws,
-                st.session_state.collected_hierarchy,
-                st.session_state.collected_precs
-            )
-            
-            st.download_button(
-                label="📝 마크다운 다운로드",
-                data=md_content,
-                file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
-                mime="text/markdown",
-                use_container_width=True
-            )
-        
-        # 수집된 법령 목록 표시
-        with st.expander("📊 수집된 법령 목록"):
+        # 수집 결과 상세
+        with st.expander("📊 수집 결과 상세"):
             for law_id, law in st.session_state.collected_laws.items():
-                article_count = len(law.get('articles', []))
-                attachment_count = len(law.get('attachments', []))
-                st.write(f"- {law['law_name']} ({law.get('law_type', '')}) - 조문: {article_count}개, 별표: {attachment_count}개")
+                st.subheader(law['law_name'])
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.write(f"조문: {len(law.get('articles', []))}개")
+                with col2:
+                    st.write(f"부칙: {len(law.get('supplementary_provisions', []))}개")
+                with col3:
+                    st.write(f"별표: {len(law.get('attachments', []))}개")
+                
+                # 샘플 조문 표시
+                if law.get('articles'):
+                    st.write("**샘플 조문:**")
+                    sample = law['articles'][0]
+                    st.text(f"{sample['number']} {sample.get('title', '')}")
+                    st.text(sample['content'][:200] + "..." if len(sample['content']) > 200 else sample['content'])
 
 
 if __name__ == "__main__":
