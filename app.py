@@ -1,6 +1,6 @@
 """
-개선된 법령 수집기 - 파일 업로드 + 직접 검색 통합 버전
-법령명 추출 정확도 향상 및 기존 검색 기능 유지
+법제처 법령 수집기 - 최종 통합 버전
+직접 검색 + 파일 업로드 + 개선된 법령명 추출
 """
 
 import streamlit as st
@@ -18,6 +18,7 @@ import pandas as pd
 import openpyxl
 import PyPDF2
 import pdfplumber
+from typing import List, Set
 
 # SSL 경고 무시
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -44,7 +45,8 @@ if 'collected_laws' not in st.session_state:
 if 'file_processed' not in st.session_state:
     st.session_state.file_processed = False
 
-class ImprovedLawFileExtractor:
+
+class EnhancedLawFileExtractor:
     """개선된 파일에서 법령명 추출하는 클래스"""
     
     def __init__(self):
@@ -54,42 +56,156 @@ class ImprovedLawFileExtractor:
             '총리령', '부령', '관한 규정', '상위법', '하위법', '관련법령'
         ]
         
-        # 정확한 법령명 패턴 (더 엄격하게)
+        # 개선된 법령명 패턴
         self.law_patterns = [
-            # 구체적인 법령명 패턴 (2개 이상의 한글 + 법령 접미사)
-            r'([가-힣]{2,}(?:에\s*관한\s*)?(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?)\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}(?:에\s*관한\s*)?(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?)\s*시행령\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}(?:에\s*관한\s*)?(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?)\s*시행규칙\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}감독규정)\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}업무시행세칙)\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}(?:에\s*관한\s*)?규정)\s*(?:\[시행[^\]]+\])?',
-            r'([가-힣]{2,}분류)\s*(?:\[시행[^\]]+\])?',  # 한국표준산업분류 등
+            # 패턴 1: 일반적인 법률명 (띄어쓰기 포함)
+            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?(?:특별|기본|관리|촉진|지원|육성|진흥|보호|규제|방지)?법(?:률)?)\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 2: 시행령 (개선됨)
+            r'([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s+시행령\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 3: 시행규칙 (개선됨)
+            r'([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s+시행규칙\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 4: 감독규정 (띄어쓰기 허용)
+            r'([가-힣]+(?:\s+[가-힣]+)*감독규정)\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 5: 업무시행세칙
+            r'([가-힣]+(?:\s+[가-힣]+)*업무시행세칙)\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 6: ~에 관한 규정 (개선됨)
+            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?규정)(?:\s+시행세칙)?\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 7: 분류 (한국표준산업분류 등)
+            r'([가-힣]+(?:\s+[가-힣]+)*분류)\s*(?:\[시행[^\]]+\])?',
+            
+            # 패턴 8: 시행세칙이 포함된 규정
+            r'([가-힣]+(?:\s+[가-힣]+)*(?:에\s*관한\s*)?규정\s+시행세칙)\s*(?:\[시행[^\]]+\])?',
         ]
         
-    def extract_from_pdf(self, file):
+    def extract_from_pdf(self, file) -> List[str]:
         """PDF 파일에서 법령명 추출 - 개선된 버전"""
-        laws = set()
+        all_text = ""
         
         try:
-            # pdfplumber 사용
+            # pdfplumber로 전체 텍스트 추출
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text()
                     if text:
-                        laws.update(self._extract_law_names_improved(text))
+                        all_text += text + "\n"
         except:
             # 실패 시 PyPDF2로 시도
             try:
+                file.seek(0)  # 파일 포인터 리셋
                 pdf_reader = PyPDF2.PdfReader(file)
                 for page in pdf_reader.pages:
                     text = page.extract_text()
-                    laws.update(self._extract_law_names_improved(text))
+                    all_text += text + "\n"
             except Exception as e:
                 st.error(f"PDF 읽기 오류: {str(e)}")
+                return []
         
-        return list(laws)
+        # 전체 텍스트에서 법령명 추출
+        laws = self._extract_laws_from_text(all_text)
+        return sorted(list(laws))
     
-    def extract_from_excel(self, file):
+    def _extract_laws_from_text(self, text: str) -> Set[str]:
+        """텍스트에서 법령명 추출 - 개선된 버전"""
+        laws = set()
+        
+        # 텍스트 전처리
+        # 1. 여러 줄에 걸쳐 있는 법령명 처리를 위해 불필요한 줄바꿈 제거
+        text = self._preprocess_text(text)
+        
+        # 2. 모든 패턴으로 법령명 추출
+        for pattern in self.law_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+            for match in matches:
+                law_name = self._clean_law_name(match)
+                if self._is_valid_law_name(law_name):
+                    laws.add(law_name)
+        
+        # 3. 특수 케이스 처리 (합성어)
+        laws.update(self._extract_compound_laws(text))
+        
+        return laws
+    
+    def _preprocess_text(self, text: str) -> str:
+        """텍스트 전처리"""
+        # 연속된 공백을 하나로
+        text = re.sub(r'\s+', ' ', text)
+        
+        # 특정 패턴 사이의 줄바꿈 제거 (법령명이 줄바꿈으로 분리된 경우)
+        # 예: "금융기관\n검사 및 제재에 관한 규정"
+        text = re.sub(r'([가-힣]+)\s*\n\s*([가-힣]+(?:\s+및\s+)?[가-힣]*(?:에\s*관한)?)', r'\1 \2', text)
+        
+        return text
+    
+    def _clean_law_name(self, law_name: str) -> str:
+        """법령명 정제"""
+        # 문자열인지 확인
+        if not isinstance(law_name, str):
+            law_name = str(law_name)
+        
+        # 시행 정보 제거
+        law_name = re.sub(r'\s*\[시행[^\]]+\]', '', law_name)
+        
+        # 앞뒤 공백 제거
+        law_name = law_name.strip()
+        
+        # 연속된 공백을 하나로
+        law_name = ' '.join(law_name.split())
+        
+        return law_name
+    
+    def _is_valid_law_name(self, law_name: str) -> bool:
+        """유효한 법령명인지 검증"""
+        # 제외 키워드 체크 (정확히 일치하는 경우만)
+        if law_name in self.exclude_keywords:
+            return False
+        
+        # 너무 짧은 것 제외 (최소 3자 이상)
+        if len(law_name) < 3:
+            return False
+        
+        # 최소 2글자 이상의 한글이 있어야 함
+        korean_chars = re.findall(r'[가-힣]+', law_name)
+        if not korean_chars or max(len(k) for k in korean_chars) < 2:
+            return False
+        
+        # 법령 관련 키워드가 포함되어 있어야 함
+        law_keywords = ['법', '령', '규칙', '규정', '고시', '훈령', '예규', '지침', '세칙', '분류']
+        if not any(keyword in law_name for keyword in law_keywords):
+            return False
+        
+        return True
+    
+    def _extract_compound_laws(self, text: str) -> Set[str]:
+        """합성 법령명 추출 (시행령, 시행규칙이 따로 표시된 경우)"""
+        compound_laws = set()
+        
+        # 패턴: "법률명" 다음 줄에 "시행령" 또는 "시행규칙"이 오는 경우
+        base_law_pattern = r'([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s*(?:\[시행[^\]]+\])?\s*\n'
+        
+        matches = re.finditer(base_law_pattern, text)
+        for match in matches:
+            base_law = self._clean_law_name(match.group(1))
+            
+            # 다음 몇 줄에서 시행령/시행규칙 찾기
+            next_text = text[match.end():match.end() + 200]  # 다음 200자 확인
+            
+            # 시행령 찾기
+            if f"{base_law} 시행령" in next_text or f"{base_law}시행령" in next_text:
+                compound_laws.add(f"{base_law} 시행령")
+            
+            # 시행규칙 찾기
+            if f"{base_law} 시행규칙" in next_text or f"{base_law}시행규칙" in next_text:
+                compound_laws.add(f"{base_law} 시행규칙")
+        
+        return compound_laws
+    
+    def extract_from_excel(self, file) -> List[str]:
         """Excel 파일에서 법령명 추출"""
         laws = set()
         
@@ -99,75 +215,45 @@ class ImprovedLawFileExtractor:
             for sheet_name in excel_file.sheet_names:
                 df = pd.read_excel(file, sheet_name=sheet_name)
                 
+                # 모든 셀의 텍스트를 하나로 합침
+                all_text = ""
                 for column in df.columns:
                     for value in df[column].dropna():
                         if isinstance(value, str):
-                            laws.update(self._extract_law_names_improved(value))
+                            all_text += value + "\n"
+                
+                # 전체 텍스트에서 법령명 추출
+                laws.update(self._extract_laws_from_text(all_text))
+                
         except Exception as e:
             st.error(f"Excel 읽기 오류: {str(e)}")
         
-        return list(laws)
+        return sorted(list(laws))
     
-    def extract_from_markdown(self, file):
+    def extract_from_markdown(self, file) -> List[str]:
         """Markdown 파일에서 법령명 추출"""
         laws = set()
         
         try:
             content = file.read().decode('utf-8')
-            laws.update(self._extract_law_names_improved(content))
+            laws.update(self._extract_laws_from_text(content))
         except Exception as e:
             st.error(f"Markdown 읽기 오류: {str(e)}")
         
-        return list(laws)
+        return sorted(list(laws))
     
-    def extract_from_text(self, file):
+    def extract_from_text(self, file) -> List[str]:
         """텍스트 파일에서 법령명 추출"""
         laws = set()
         
         try:
             content = file.read().decode('utf-8')
-            laws.update(self._extract_law_names_improved(content))
+            laws.update(self._extract_laws_from_text(content))
         except Exception as e:
             st.error(f"텍스트 파일 읽기 오류: {str(e)}")
         
-        return list(laws)
-    
-    def _extract_law_names_improved(self, text):
-        """개선된 법령명 추출 - 더 정확하게"""
-        laws = set()
-        
-        # 줄 단위로 처리하여 더 정확한 추출
-        lines = text.split('\n')
-        
-        for line in lines:
-            # 각 패턴으로 매칭
-            for pattern in self.law_patterns:
-                matches = re.findall(pattern, line)
-                for match in matches:
-                    law_name = match.strip()
-                    
-                    # 시행 정보 제거
-                    law_name = re.sub(r'\s*\[시행[^\]]+\]', '', law_name)
-                    
-                    # 정제
-                    law_name = law_name.replace('\n', ' ').replace('\t', ' ')
-                    law_name = ' '.join(law_name.split())
-                    
-                    # 제외 키워드 체크 (정확히 일치하는 경우만)
-                    if law_name in self.exclude_keywords:
-                        continue
-                    
-                    # 너무 짧은 것 제외 (최소 3자 이상)
-                    if len(law_name) < 3:
-                        continue
-                    
-                    # 유효성 검증
-                    # 1. 최소 2글자 이상의 한글이 법령 접미사 앞에 있어야 함
-                    if re.match(r'^[가-힣]{2,}', law_name):
-                        laws.add(law_name)
-        
-        # 중복 제거 및 정렬
         return sorted(list(laws))
+
 
 class LawCollectorAPI:
     """법령 수집 API 클래스"""
@@ -175,7 +261,7 @@ class LawCollectorAPI:
     def __init__(self):
         self.law_search_url = "http://www.law.go.kr/DRF/lawSearch.do"
         self.law_detail_url = "http://www.law.go.kr/DRF/lawService.do"
-        self.delay = 0.5
+        self.delay = 0.5  # API 호출 간격
         
     def search_law(self, oc_code: str, law_name: str):
         """법령 검색"""
@@ -201,9 +287,12 @@ class LawCollectorAPI:
                 return []
             
             content = response.text
+            
+            # BOM 제거
             if content.startswith('\ufeff'):
                 content = content[1:]
             
+            # XML 파싱
             root = ET.fromstring(content.encode('utf-8'))
             laws = []
             
@@ -243,7 +332,7 @@ class LawCollectorAPI:
             response = requests.get(
                 self.law_detail_url,
                 params=params,
-                timeout=30,
+                timeout=30,  # 타임아웃 증가
                 verify=False
             )
             response.encoding = 'utf-8'
@@ -253,6 +342,8 @@ class LawCollectorAPI:
                 return None
             
             content = response.text
+            
+            # BOM 제거
             if content.startswith('\ufeff'):
                 content = content[1:]
             
@@ -270,10 +361,10 @@ class LawCollectorAPI:
                 'law_type': '',
                 'promulgation_date': '',
                 'enforcement_date': '',
-                'articles': [],
-                'supplementary_provisions': [],
-                'attachments': [],
-                'raw_content': '',
+                'articles': [],          # 조문
+                'supplementary_provisions': [],  # 부칙
+                'attachments': [],       # 별표/별첨
+                'raw_content': '',       # 전체 원문
             }
             
             # 기본 정보
@@ -283,11 +374,16 @@ class LawCollectorAPI:
                 law_detail['promulgation_date'] = basic_info.findtext('공포일자', '')
                 law_detail['enforcement_date'] = basic_info.findtext('시행일자', '')
             
-            # 조문, 부칙, 별표 추출 (기존 코드 동일)
+            # 전체 조문 추출 - 다양한 방법 시도
             self._extract_all_articles(root, law_detail)
+            
+            # 부칙 추출
             self._extract_supplementary_provisions(root, law_detail)
+            
+            # 별표/별첨 추출
             self._extract_attachments(root, law_detail)
             
+            # 전체 원문 추출 (폴백)
             if not law_detail['articles']:
                 law_detail['raw_content'] = self._extract_full_text(root)
             
@@ -297,16 +393,18 @@ class LawCollectorAPI:
             st.warning(f"{law_name} 수집 중 오류: {str(e)}")
             return None
     
-    # 나머지 메서드들은 기존과 동일...
     def _extract_all_articles(self, root, law_detail):
-        """모든 조문 추출"""
+        """모든 조문 추출 - 강화된 버전"""
+        # 방법 1: 조문 태그 직접 찾기
         articles_section = root.find('.//조문')
         if articles_section is not None:
+            # 조문단위 찾기
             for article_unit in articles_section.findall('.//조문단위'):
                 article_info = self._parse_article_unit(article_unit)
                 if article_info:
                     law_detail['articles'].append(article_info)
         
+        # 방법 2: 조문내용 직접 찾기
         if not law_detail['articles']:
             for article_content in root.findall('.//조문내용'):
                 if article_content.text:
@@ -314,6 +412,7 @@ class LawCollectorAPI:
                     if article_info:
                         law_detail['articles'].append(article_info)
         
+        # 방법 3: 전체 요소 순회
         if not law_detail['articles']:
             article_elements = []
             for elem in root.iter():
@@ -334,18 +433,23 @@ class LawCollectorAPI:
             'paragraphs': []
         }
         
+        # 조문번호
         article_num = article_elem.findtext('조문번호', '')
         if article_num:
             article_info['number'] = f"제{article_num}조"
         
+        # 조문제목
         article_info['title'] = article_elem.findtext('조문제목', '')
         
+        # 조문내용
         article_content = article_elem.findtext('조문내용', '')
         if not article_content:
+            # 전체 텍스트 추출
             article_content = self._get_all_text(article_elem)
         
         article_info['content'] = article_content
         
+        # 항 추출
         for para in article_elem.findall('.//항'):
             para_info = {
                 'number': para.findtext('항번호', ''),
@@ -358,6 +462,7 @@ class LawCollectorAPI:
     
     def _parse_article_text(self, text):
         """조문 텍스트 파싱"""
+        # 제1조, 제2조 등의 패턴 찾기
         pattern = r'(제\d+조(?:의\d+)?)\s*(?:\((.*?)\))?\s*(.*?)(?=제\d+조|$)'
         matches = re.findall(pattern, text, re.DOTALL)
         
@@ -370,6 +475,7 @@ class LawCollectorAPI:
                 'paragraphs': []
             }
             
+            # 항 분리 (①, ②, ... 패턴)
             para_pattern = r'([①②③④⑤⑥⑦⑧⑨⑩]+)\s*(.*?)(?=[①②③④⑤⑥⑦⑧⑨⑩]|$)'
             para_matches = re.findall(para_pattern, article_info['content'], re.DOTALL)
             
@@ -392,24 +498,28 @@ class LawCollectorAPI:
             'paragraphs': []
         }
         
+        # 조문번호 찾기
         for tag in ['조문번호', '조번호', '번호']:
             num = elem.findtext(tag, '')
             if num:
                 article_info['number'] = f"제{num}조" if not num.startswith('제') else num
                 break
         
+        # 조문제목 찾기
         for tag in ['조문제목', '조제목', '제목']:
             title = elem.findtext(tag, '')
             if title:
                 article_info['title'] = title
                 break
         
+        # 조문내용 찾기
         for tag in ['조문내용', '조내용', '내용']:
             content = elem.findtext(tag, '')
             if content:
                 article_info['content'] = content
                 break
         
+        # 내용이 없으면 전체 텍스트
         if not article_info['content']:
             article_info['content'] = self._get_all_text(elem)
         
@@ -417,6 +527,7 @@ class LawCollectorAPI:
     
     def _extract_supplementary_provisions(self, root, law_detail):
         """부칙 추출"""
+        # 부칙 태그 찾기
         for addendum in root.findall('.//부칙'):
             addendum_info = {
                 'number': addendum.findtext('부칙번호', ''),
@@ -426,6 +537,7 @@ class LawCollectorAPI:
             if addendum_info['content']:
                 law_detail['supplementary_provisions'].append(addendum_info)
         
+        # 부칙내용 직접 찾기
         if not law_detail['supplementary_provisions']:
             for elem in root.iter():
                 if elem.tag == '부칙내용' and elem.text:
@@ -437,6 +549,7 @@ class LawCollectorAPI:
     
     def _extract_attachments(self, root, law_detail):
         """별표/별첨 추출"""
+        # 별표 찾기
         for table in root.findall('.//별표'):
             table_info = {
                 'type': '별표',
@@ -447,6 +560,7 @@ class LawCollectorAPI:
             if table_info['content'] or table_info['title']:
                 law_detail['attachments'].append(table_info)
         
+        # 별지 찾기
         for form in root.findall('.//별지'):
             form_info = {
                 'type': '별지',
@@ -457,6 +571,7 @@ class LawCollectorAPI:
             if form_info['content'] or form_info['title']:
                 law_detail['attachments'].append(form_info)
         
+        # 서식 찾기
         for format_elem in root.findall('.//서식'):
             format_info = {
                 'type': '서식',
@@ -468,21 +583,24 @@ class LawCollectorAPI:
                 law_detail['attachments'].append(format_info)
     
     def _extract_full_text(self, root):
-        """전체 텍스트 추출"""
+        """전체 텍스트 추출 (폴백)"""
         return self._get_all_text(root)
     
     def _get_all_text(self, elem):
         """요소의 모든 텍스트 추출"""
         texts = []
         
+        # 현재 요소의 텍스트
         if elem.text and elem.text.strip():
             texts.append(elem.text.strip())
         
+        # 모든 자식 요소의 텍스트
         for child in elem:
             child_text = self._get_all_text(child)
             if child_text:
                 texts.append(child_text)
             
+            # tail 텍스트 (요소 뒤의 텍스트)
             if child.tail and child.tail.strip():
                 texts.append(child.tail.strip())
         
@@ -493,6 +611,7 @@ class LawCollectorAPI:
         zip_buffer = BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # 전체 JSON 데이터
             all_data = {
                 'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'total_laws': len(laws_dict),
@@ -504,20 +623,24 @@ class LawCollectorAPI:
                 json.dumps(all_data, ensure_ascii=False, indent=2)
             )
             
+            # 개별 법령 파일
             for law_id, law in laws_dict.items():
                 safe_name = re.sub(r'[\\/*?:"<>|]', '_', law['law_name'])
                 
+                # JSON 파일
                 zip_file.writestr(
                     f'laws/{safe_name}.json',
                     json.dumps(law, ensure_ascii=False, indent=2)
                 )
                 
+                # 텍스트 파일 (전체 내용 포함)
                 text_content = self._format_law_full_text(law)
                 zip_file.writestr(
                     f'laws/{safe_name}.txt',
                     text_content
                 )
             
+            # README 파일
             readme = self._create_readme(laws_dict)
             zip_file.writestr('README.md', readme)
         
@@ -528,6 +651,7 @@ class LawCollectorAPI:
         """법령 전체 내용을 텍스트로 포맷"""
         lines = []
         
+        # 헤더
         lines.append(f"{'=' * 80}")
         lines.append(f"법령명: {law['law_name']}")
         lines.append(f"법종구분: {law.get('law_type', '')}")
@@ -535,18 +659,21 @@ class LawCollectorAPI:
         lines.append(f"시행일자: {law.get('enforcement_date', '')}")
         lines.append(f"{'=' * 80}\n")
         
+        # 조문
         if law.get('articles'):
             lines.append("【 조 문 】\n")
             for article in law['articles']:
                 lines.append(f"\n{article['number']} {article.get('title', '')}")
                 lines.append(article['content'])
                 
+                # 항
                 if article.get('paragraphs'):
                     for para in article['paragraphs']:
                         lines.append(f"\n  {para['number']} {para['content']}")
                 
-                lines.append("")
+                lines.append("")  # 조문 간 공백
         
+        # 부칙
         if law.get('supplementary_provisions'):
             lines.append("\n\n【 부 칙 】\n")
             for idx, supp in enumerate(law['supplementary_provisions'], 1):
@@ -556,6 +683,7 @@ class LawCollectorAPI:
                     lines.append(f"\n부칙 {idx}")
                 lines.append(supp['content'])
         
+        # 별표/별첨
         if law.get('attachments'):
             lines.append("\n\n【 별표/별첨 】\n")
             for attach in law['attachments']:
@@ -563,6 +691,7 @@ class LawCollectorAPI:
                 lines.append(attach['content'])
                 lines.append("")
         
+        # 원문 (조문이 없는 경우)
         if not law.get('articles') and law.get('raw_content'):
             lines.append("\n\n【 원 문 】\n")
             lines.append(law['raw_content'])
@@ -587,6 +716,7 @@ class LawCollectorAPI:
 ## 📊 수집 통계
 
 """
+        # 통계
         total_articles = 0
         total_provisions = 0
         total_attachments = 0
@@ -667,8 +797,10 @@ def main():
         
         # 초기화 버튼
         if st.button("🔄 초기화", type="secondary", use_container_width=True):
-            for key in st.session_state:
-                if key != 'mode':
+            # 세션 상태 초기화
+            keys_to_keep = ['mode']
+            for key in list(st.session_state.keys()):
+                if key not in keys_to_keep:
                     del st.session_state[key]
             st.experimental_rerun()
     
@@ -702,7 +834,7 @@ def main():
     # 파일 업로드 모드
     else:
         st.header("📄 파일 업로드 모드")
-        extractor = ImprovedLawFileExtractor()
+        extractor = EnhancedLawFileExtractor()  # 개선된 추출기 사용
         
         # 파일에서 법령 추출
         if uploaded_file and not st.session_state.file_processed:
@@ -772,10 +904,12 @@ def main():
                 if not oc_code:
                     st.error("기관코드를 입력해주세요!")
                 else:
+                    # 검색 시작
                     search_results = []
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
+                    # 수정된 법령명으로 업데이트
                     if edited_laws:
                         st.session_state.extracted_laws = edited_laws
                     
@@ -786,9 +920,11 @@ def main():
                         progress_bar.progress(progress)
                         status_text.text(f"검색 중: {law_name}")
                         
+                        # API 검색
                         results = collector.search_law(oc_code, law_name)
                         
                         for result in results:
+                            # 검색어와 유사한 결과만 포함
                             if law_name in result['law_name'] or result['law_name'] in law_name:
                                 result['search_query'] = law_name
                                 search_results.append(result)
@@ -884,6 +1020,7 @@ def display_search_results_and_collect(collector, oc_code, is_file_mode=False):
                 progress_bar.progress(progress)
                 status_text.text(f"수집 중 ({idx + 1}/{total}): {law['law_name']}")
                 
+                # 상세 정보 수집
                 law_detail = collector.get_law_detail_with_full_content(
                     oc_code,
                     law['law_id'],
@@ -962,11 +1099,13 @@ def display_search_results_and_collect(collector, oc_code, is_file_mode=False):
                 with col3:
                     st.write(f"별표: {len(law.get('attachments', []))}개")
                 
+                # 샘플 조문 표시
                 if law.get('articles'):
                     st.write("**샘플 조문:**")
                     sample = law['articles'][0]
                     st.text(f"{sample['number']} {sample.get('title', '')}")
-                    st.text(sample['content'][:200] + "..." if len(sample['content']) > 200 else sample['content'])
+                    content_preview = sample['content'][:200] + "..." if len(sample['content']) > 200 else sample['content']
+                    st.text(content_preview)
 
 
 if __name__ == "__main__":
