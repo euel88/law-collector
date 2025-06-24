@@ -377,30 +377,55 @@ class EnhancedLawFileExtractor:
                 # 프롬프트 구성
                 prompt = self._create_ai_prompt(sample, laws)
                 
-                # API 호출
-                response = client.chat.completions.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": "한국 법령 데이터베이스 전문가"},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=1000
-                )
-                
-                # 응답 파싱
-                ai_laws = self._parse_ai_response(response.choices[0].message.content)
-                
-                self.logger.info(f"AI가 추가로 {len(ai_laws - laws)}개의 법령을 찾았습니다.")
-                
-                # 결과 병합
-                return laws.union(ai_laws)
+                # API 호출 - 안전한 방식으로
+                try:
+                    response = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=[
+                            {"role": "system", "content": "한국 법령 데이터베이스 전문가"},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                        max_tokens=1000
+                    )
+                    
+                    # 응답 파싱
+                    ai_laws = self._parse_ai_response(response.choices[0].message.content)
+                    
+                    self.logger.info(f"AI가 추가로 {len(ai_laws - laws)}개의 법령을 찾았습니다.")
+                    
+                    # 결과 병합
+                    return laws.union(ai_laws)
+                    
+                except Exception as chat_error:
+                    # GPT-3.5가 실패하면 GPT-4 시도
+                    try:
+                        response = client.chat.completions.create(
+                            model="gpt-4",
+                            messages=[
+                                {"role": "system", "content": "한국 법령 데이터베이스 전문가"},
+                                {"role": "user", "content": prompt}
+                            ],
+                            temperature=0.1,
+                            max_tokens=1000
+                        )
+                        
+                        ai_laws = self._parse_ai_response(response.choices[0].message.content)
+                        self.logger.info(f"GPT-4로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
+                        return laws.union(ai_laws)
+                        
+                    except:
+                        self.logger.warning("AI 기능을 사용할 수 없습니다. 기본 추출만 수행합니다.")
+                        return laws
                 
             except Exception as api_error:
                 error_msg = str(api_error)
                 if "401" in error_msg or "Incorrect API key" in error_msg:
                     self.logger.error("API 키가 유효하지 않습니다. 키를 다시 확인해주세요.")
                     st.error("⚠️ OpenAI API 키가 유효하지 않습니다. 올바른 키인지 확인해주세요.")
+                elif "insufficient_quota" in error_msg:
+                    self.logger.warning("API 사용량 한도 초과")
+                    st.warning("⚠️ OpenAI API 사용량 한도를 초과했습니다.")
                 else:
                     self.logger.error(f"OpenAI API 호출 오류: {error_msg}")
                 return laws
@@ -1907,15 +1932,45 @@ def show_sidebar():
                                         # 테스트용 클라이언트 생성
                                         test_client = OpenAI(api_key=cleaned_key)
                                         
-                                        # 간단한 테스트 - 모델 목록 조회
-                                        test_client.models.list(limit=1)
+                                        # 버전 독립적인 API 테스트
+                                        success = False
+                                        try:
+                                            # 가장 간단한 API 호출 - chat completion
+                                            test_response = test_client.chat.completions.create(
+                                                model="gpt-3.5-turbo",
+                                                messages=[{"role": "user", "content": "test"}],
+                                                max_tokens=1
+                                            )
+                                            success = True
+                                        except Exception as chat_error:
+                                            # chat API 실패 시 models API 시도
+                                            try:
+                                                # 신버전 API 호환
+                                                test_response = test_client.models.list()
+                                                if test_response and hasattr(test_response, 'data'):
+                                                    success = True
+                                            except:
+                                                # 구버전 API 호환
+                                                try:
+                                                    # 간단한 완료 테스트
+                                                    test_response = test_client.completions.create(
+                                                        model="text-davinci-003",
+                                                        prompt="test",
+                                                        max_tokens=1
+                                                    )
+                                                    success = True
+                                                except:
+                                                    success = False
                                         
-                                        # 성공하면 세션에 저장
-                                        st.session_state.openai_api_key = cleaned_key
-                                        st.session_state.use_ai = True
-                                        st.success("✅ API 키가 검증되었습니다!")
-                                        logger.info(f"API 키 설정 및 검증 완료")
-                                        st.rerun()
+                                        if success:
+                                            # 성공하면 세션에 저장
+                                            st.session_state.openai_api_key = cleaned_key
+                                            st.session_state.use_ai = True
+                                            st.success("✅ API 키가 검증되었습니다!")
+                                            logger.info(f"API 키 설정 및 검증 완료")
+                                            st.rerun()
+                                        else:
+                                            raise Exception("API 키 검증 실패")
                                         
                                     except Exception as e:
                                         error_msg = str(e)
