@@ -1,8 +1,8 @@
 """
-법제처 법령 수집기 - 버그 수정 버전 (v6.4)
+법제처 법령 수집기 - 버그 수정 버전 (v6.5)
 - OpenAI API 키 인식 문제 해결
-- 별표/별첨 PDF 다운로드 기능 추가
-- 디버깅 로그 강화
+- 파일 다운로드 형식 지원 확대
+- 별표/별첨 PDF 다운로드 기능 개선
 """
 
 import streamlit as st
@@ -347,29 +347,37 @@ class EnhancedLawFileExtractor:
                 self.logger.warning("OpenAI 라이브러리가 설치되지 않았습니다.")
                 return laws
             
-            # API 키 유효성 검증 - 더 상세한 로깅
+            # API 키 유효성 검증 개선
             if not self.api_key:
                 self.logger.warning("API 키가 설정되지 않았습니다.")
                 return laws
             
-            # API 키 형식 검증 개선
-            if not self.api_key.startswith(('sk-', 'sess-')):
-                self.logger.warning(f"유효하지 않은 API 키 형식: {self.api_key[:10]}...")
+            # API 키 정리 (공백 제거, 특수문자 확인)
+            cleaned_key = self.api_key.strip()
+            
+            # API 키 형식 검증
+            if not (cleaned_key.startswith('sk-') or cleaned_key.startswith('sess-')):
+                self.logger.warning(f"유효하지 않은 API 키 형식")
                 return laws
             
-            self.logger.info(f"OpenAI API 키 사용 중: {self.api_key[:10]}...")
+            self.logger.info(f"OpenAI API 키 사용 중: {cleaned_key[:10]}...")
             
-            # OpenAI 클라이언트 생성
-            client = OpenAI(api_key=self.api_key)
+            # OpenAI 클라이언트 생성 (키 재설정)
+            client = OpenAI(
+                api_key=cleaned_key,
+                max_retries=2,
+                timeout=30.0
+            )
             
-            # 텍스트 샘플링 (토큰 제한)
-            sample = text[:3000]
-            
-            # 프롬프트 구성
-            prompt = self._create_ai_prompt(sample, laws)
-            
-            # API 호출 (에러 처리 강화)
+            # API 키 테스트를 위한 간단한 호출
             try:
+                # 텍스트 샘플링 (토큰 제한)
+                sample = text[:3000]
+                
+                # 프롬프트 구성
+                prompt = self._create_ai_prompt(sample, laws)
+                
+                # API 호출
                 response = client.chat.completions.create(
                     model="gpt-3.5-turbo",
                     messages=[
@@ -389,8 +397,12 @@ class EnhancedLawFileExtractor:
                 return laws.union(ai_laws)
                 
             except Exception as api_error:
-                self.logger.error(f"OpenAI API 호출 오류: {api_error}")
-                st.warning(f"AI 기능 오류: {str(api_error)}")
+                error_msg = str(api_error)
+                if "401" in error_msg or "Incorrect API key" in error_msg:
+                    self.logger.error("API 키가 유효하지 않습니다. 키를 다시 확인해주세요.")
+                    st.error("⚠️ OpenAI API 키가 유효하지 않습니다. 올바른 키인지 확인해주세요.")
+                else:
+                    self.logger.error(f"OpenAI API 호출 오류: {error_msg}")
                 return laws
             
         except Exception as e:
@@ -500,6 +512,12 @@ class LawCollectorAPI:
         self.config = APIConfig()
         self.logger = logging.getLogger(self.__class__.__name__)
         self.session = self._create_session()
+        self._cache = {}  # 검색 결과 캐시
+        
+    @lru_cache(maxsize=128)
+    def _get_cached_search_result(self, law_name: str) -> Optional[str]:
+        """캐시된 검색 결과 반환"""
+        return None  # 실제 구현시 캐시 로직 추가
         
     def _create_session(self) -> requests.Session:
         """재사용 가능한 세션 생성"""
@@ -894,7 +912,7 @@ class LawCollectorAPI:
     
     def _parse_law_detail(self, content: str, law_id: str, 
                          law_msn: str, law_name: str) -> Dict[str, Any]:
-        """일반 법령 상세 정보 파싱"""
+        """일반 법령 상세 정보 파싱 - 개선된 PDF 추출"""
         detail = {
             'law_id': law_id,
             'law_msn': law_msn,
@@ -935,8 +953,8 @@ class LawCollectorAPI:
             # 별표 추출
             self._extract_attachments(root, detail)
             
-            # PDF 첨부파일 추출 (새로운 기능)
-            self._extract_pdf_attachments(root, detail)
+            # PDF 첨부파일 추출 - 개선된 버전
+            self._extract_pdf_attachments_enhanced(root, detail)
             
             # 원문 저장 (조문이 없는 경우)
             if not detail['articles']:
@@ -1000,8 +1018,8 @@ class LawCollectorAPI:
             # 별표 추출
             self._extract_attachments(root, detail)
             
-            # PDF 첨부파일 추출 (새로운 기능)
-            self._extract_pdf_attachments(root, detail)
+            # PDF 첨부파일 추출 - 개선된 버전
+            self._extract_pdf_attachments_enhanced(root, detail)
             
             # 원문 저장
             if not detail['articles']:
@@ -1127,9 +1145,14 @@ class LawCollectorAPI:
             if attachment['content'] or attachment['title']:
                 detail['attachments'].append(attachment)
     
-    def _extract_pdf_attachments(self, root: ET.Element, detail: Dict[str, Any]) -> None:
-        """PDF 첨부파일 추출 - 새로운 메서드"""
-        # 별표/별지 PDF 파일 검색
+    def _extract_pdf_attachments_enhanced(self, root: ET.Element, detail: Dict[str, Any]) -> None:
+        """PDF 첨부파일 추출 - 개선된 버전"""
+        # 별표/별지 정보에서 PDF URL 패턴 추출
+        law_name = detail['law_name']
+        law_msn = detail['law_msn']
+        promulgation_date = detail.get('promulgation_date', '').replace('-', '')
+        
+        # 1. XML에서 직접 파일 정보 추출
         for elem in root.iter():
             # 파일 링크나 ID 찾기
             file_seq = elem.findtext('파일순번', '')
@@ -1140,37 +1163,183 @@ class LawCollectorAPI:
                     'file_seq': file_seq,
                     'file_name': file_name,
                     'type': '별표' if '별표' in file_name else '별지',
-                    'url': self._build_pdf_url(detail['law_msn'], file_seq)
+                    'url': self._build_pdf_url(law_msn, file_seq)
                 }
                 detail['attachment_pdfs'].append(pdf_info)
                 self.logger.debug(f"PDF 첨부파일 발견: {file_name}")
+        
+        # 2. 별표/별지 번호 기반 URL 생성 (대체 방법)
+        if detail['attachments']:
+            for attachment in detail['attachments']:
+                # 별표 처리
+                if attachment['type'] == '별표' and attachment['number']:
+                    # 다양한 URL 패턴 시도
+                    pdf_urls = self._build_alternative_pdf_urls(
+                        law_name, '별표', attachment['number'], promulgation_date
+                    )
+                    
+                    pdf_info = {
+                        'file_seq': '',
+                        'file_name': f"{law_name}_별표{attachment['number']}.pdf",
+                        'type': '별표',
+                        'url': pdf_urls[0],  # 기본 URL
+                        'alternative_urls': pdf_urls[1:],  # 대체 URL들
+                        'direct_url': True
+                    }
+                    
+                    # 중복 체크
+                    if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
+                        detail['attachment_pdfs'].append(pdf_info)
+                        self.logger.debug(f"별표 PDF URL 생성: {pdf_urls[0]}")
+                
+                # 별지/별첨 처리
+                elif attachment['type'] in ['별지', '별첨'] and attachment['number']:
+                    # 다양한 URL 패턴 시도
+                    pdf_urls = self._build_alternative_pdf_urls(
+                        law_name, '별지', attachment['number'], promulgation_date
+                    )
+                    
+                    pdf_info = {
+                        'file_seq': '',
+                        'file_name': f"{law_name}_별지{attachment['number']}.pdf",
+                        'type': '별지',
+                        'url': pdf_urls[0],  # 기본 URL
+                        'alternative_urls': pdf_urls[1:],  # 대체 URL들
+                        'direct_url': True
+                    }
+                    
+                    # 중복 체크
+                    if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
+                        detail['attachment_pdfs'].append(pdf_info)
+                        self.logger.debug(f"별지 PDF URL 생성: {pdf_urls[0]}")
     
     def _build_pdf_url(self, law_msn: str, file_seq: str) -> str:
-        """PDF 다운로드 URL 생성"""
+        """PDF 다운로드 URL 생성 (기본 API용)"""
         # 법제처 PDF 다운로드 URL 패턴
         return f"{self.config.PDF_DOWNLOAD_URL}?flSeq={file_seq}&flNm=&type=ATTACHED_FILE&lawSeq={law_msn}"
     
+    def _build_alternative_pdf_urls(self, law_name: str, attachment_type: str, 
+                                    attachment_number: str, promulgation_date: str) -> List[str]:
+        """다양한 PDF URL 패턴 생성"""
+        urls = []
+        
+        # 날짜 형식 변환 (YYYY-MM-DD -> YYYYMMDD)
+        date_compact = promulgation_date.replace('-', '')
+        
+        # 1. 기본 패턴: /법령별표서식/(법령명,날짜,별표번호)
+        base_url = f"https://www.law.go.kr/법령별표서식/({law_name},{date_compact},{attachment_type}{attachment_number})"
+        urls.append(base_url)
+        
+        # 2. URL 인코딩된 패턴
+        import urllib.parse
+        encoded_law_name = urllib.parse.quote(law_name)
+        encoded_url = f"https://www.law.go.kr/법령별표서식/({encoded_law_name},{date_compact},{attachment_type}{attachment_number})"
+        urls.append(encoded_url)
+        
+        # 3. 대체 패턴: 첨부파일 다운로드 API
+        alt_url = f"https://www.law.go.kr/flDownload.do?type=FLAW&name={encoded_law_name}_{attachment_type}{attachment_number}.pdf"
+        urls.append(alt_url)
+        
+        # 4. 직접 파일 접근 패턴
+        direct_url = f"https://www.law.go.kr/files/law/{date_compact}/{encoded_law_name}_{attachment_type}{attachment_number}.pdf"
+        urls.append(direct_url)
+        
+        return urls
+    
     def download_pdf_attachments(self, law_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """PDF 첨부파일 다운로드 - 새로운 메서드"""
+        """PDF 첨부파일 다운로드 - 개선된 버전"""
         downloaded_pdfs = []
         
         for pdf_info in law_detail.get('attachment_pdfs', []):
             try:
                 self.logger.info(f"PDF 다운로드 중: {pdf_info['file_name']}")
                 
-                response = self.session.get(
-                    pdf_info['url'],
-                    timeout=self.config.TIMEOUT
-                )
+                # 직접 URL인 경우와 일반 URL 구분
+                if pdf_info.get('direct_url'):
+                    # 여러 URL 패턴 시도
+                    urls_to_try = [pdf_info['url']] + pdf_info.get('alternative_urls', [])
+                    
+                    for url in urls_to_try:
+                        try:
+                            # URL 인코딩 처리
+                            import urllib.parse
+                            # 한글 부분만 인코딩
+                            parsed = urllib.parse.urlparse(url)
+                            if '법령별표서식' in parsed.path:
+                                # 특별 처리 필요
+                                encoded_url = url
+                            else:
+                                encoded_url = urllib.parse.quote(url, safe=':/?=&(),%')
+                            
+                            headers = {
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                'Referer': 'https://www.law.go.kr/',
+                                'Accept': 'application/pdf,*/*',
+                                'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
+                                'Accept-Encoding': 'gzip, deflate, br'
+                            }
+                            
+                            response = self.session.get(
+                                encoded_url,
+                                headers=headers,
+                                timeout=self.config.TIMEOUT,
+                                allow_redirects=True,
+                                stream=True
+                            )
+                            
+                            # 성공한 경우
+                            if response.status_code == 200:
+                                content_type = response.headers.get('Content-Type', '')
+                                
+                                if 'application/pdf' in content_type or response.content[:4] == b'%PDF':
+                                    pdf_data = {
+                                        'file_name': pdf_info['file_name'],
+                                        'type': pdf_info['type'],
+                                        'content': response.content,
+                                        'size': len(response.content),
+                                        'url_used': url  # 성공한 URL 기록
+                                    }
+                                    downloaded_pdfs.append(pdf_data)
+                                    self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']} ({len(response.content):,} bytes) - URL: {url}")
+                                    break  # 성공했으므로 다른 URL 시도하지 않음
+                                else:
+                                    self.logger.debug(f"PDF가 아닌 컨텐츠 ({url}): {content_type}")
+                                    continue  # 다음 URL 시도
+                            else:
+                                self.logger.debug(f"다운로드 실패 ({url}): {response.status_code}")
+                                continue  # 다음 URL 시도
+                                
+                        except Exception as e:
+                            self.logger.debug(f"URL 시도 실패 ({url}): {e}")
+                            continue  # 다음 URL 시도
+                    
+                    # 모든 URL 실패한 경우
+                    if not any(pdf['file_name'] == pdf_info['file_name'] for pdf in downloaded_pdfs):
+                        self.logger.warning(f"모든 URL 시도 실패: {pdf_info['file_name']}")
+                        
+                else:
+                    # 일반 다운로드 URL
+                    response = self.session.get(
+                        pdf_info['url'],
+                        timeout=self.config.TIMEOUT,
+                        stream=True
+                    )
                 
                 if response.status_code == 200:
-                    pdf_data = {
-                        'file_name': pdf_info['file_name'],
-                        'type': pdf_info['type'],
-                        'content': response.content
-                    }
-                    downloaded_pdfs.append(pdf_data)
-                    self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']}")
+                    # Content-Type 확인
+                    content_type = response.headers.get('Content-Type', '')
+                    
+                    if 'application/pdf' in content_type or response.content[:4] == b'%PDF':
+                        pdf_data = {
+                            'file_name': pdf_info['file_name'],
+                            'type': pdf_info['type'],
+                            'content': response.content,
+                            'size': len(response.content)
+                        }
+                        downloaded_pdfs.append(pdf_data)
+                        self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']} ({len(response.content):,} bytes)")
+                    else:
+                        self.logger.warning(f"PDF가 아닌 컨텐츠: {pdf_info['file_name']} - {content_type}")
                 else:
                     self.logger.warning(f"PDF 다운로드 실패: {pdf_info['file_name']} - {response.status_code}")
                     
@@ -1282,14 +1451,14 @@ class LawExporter:
     
     def export_single_file(self, laws_dict: Dict[str, Dict[str, Any]], 
                           format: str = 'json') -> str:
-        """단일 파일로 내보내기"""
+        """단일 파일로 내보내기 - 모든 형식 지원"""
         exporters = {
             'json': self._export_as_json,
             'markdown': self._export_as_markdown,
             'text': self._export_as_text
         }
         
-        exporter = exporters.get(format, self._export_as_json)
+        exporter = exporters.get(format.lower(), self._export_as_json)
         return exporter(laws_dict)
     
     def _sanitize_filename(self, filename: str) -> str:
@@ -1588,7 +1757,7 @@ def initialize_session_state():
 
 
 def show_sidebar():
-    """사이드바 UI"""
+    """사이드바 UI - 개선된 API 키 처리"""
     with st.sidebar:
         st.header("⚙️ 설정")
         
@@ -1603,7 +1772,7 @@ def show_sidebar():
         
         st.divider()
         
-        # AI 설정 (수정된 부분)
+        # AI 설정 (개선된 버전)
         with st.expander("🤖 AI 설정 (선택사항)", expanded=False):
             st.markdown("**ChatGPT를 사용하여 법령명 추출 정확도를 높입니다**")
             
@@ -1617,37 +1786,63 @@ def show_sidebar():
                 st.info("설치하려면: `pip install openai`")
             
             if openai_available:
-                # API 키 입력 (수정: 세션 상태 관리 개선)
-                current_key = st.session_state.get('openai_api_key', '')
-                
+                # API 키 입력 - 개선된 처리
                 api_key = st.text_input(
                     "OpenAI API Key",
                     type="password",
-                    value=current_key,
+                    value="",  # 항상 빈 값으로 시작
                     key="openai_key_input",
-                    help="https://platform.openai.com/api-keys 에서 발급"
+                    help="https://platform.openai.com/api-keys 에서 발급",
+                    placeholder="sk-..."
                 )
                 
-                # 키 변경 감지 및 저장
-                if api_key != current_key:
-                    if api_key:
-                        # 키 유효성 검증
-                        if api_key.startswith(('sk-', 'sess-')) and len(api_key) > 20:
-                            st.session_state.openai_api_key = api_key
-                            st.session_state.use_ai = True
-                            st.success("✅ API 키가 설정되었습니다!")
-                            logger.info(f"API 키 설정됨: {api_key[:10]}...")
-                        else:
-                            st.error("❌ 올바른 형식의 API 키가 아닙니다.")
-                            st.session_state.openai_api_key = None
-                            st.session_state.use_ai = False
+                # 실시간 키 업데이트 (버튼 없이)
+                if api_key and api_key != st.session_state.get('openai_api_key', ''):
+                    # 키 정리 및 검증
+                    cleaned_key = api_key.strip()
+                    
+                    # 기본 형식 검증
+                    if cleaned_key.startswith(('sk-', 'sess-')) and len(cleaned_key) > 40:
+                        with st.spinner("API 키 검증 중..."):
+                            try:
+                                from openai import OpenAI
+                                # 테스트용 클라이언트 생성
+                                test_client = OpenAI(api_key=cleaned_key)
+                                
+                                # 간단한 테스트 - 모델 목록 조회
+                                test_client.models.list(limit=1)
+                                
+                                # 성공하면 세션에 저장
+                                st.session_state.openai_api_key = cleaned_key
+                                st.session_state.use_ai = True
+                                st.success("✅ API 키가 검증되었습니다!")
+                                logger.info(f"API 키 설정 및 검증 완료: {cleaned_key[:10]}...")
+                                
+                            except Exception as e:
+                                error_msg = str(e)
+                                if "401" in error_msg or "Incorrect API key" in error_msg:
+                                    st.error("❌ API 키가 유효하지 않습니다.")
+                                    st.info("올바른 OpenAI API 키인지 확인해주세요.")
+                                elif "429" in error_msg:
+                                    st.warning("⚠️ API 사용 한도 초과. 나중에 다시 시도해주세요.")
+                                else:
+                                    st.error(f"❌ API 키 검증 실패: {error_msg}")
+                                
+                                logger.error(f"API 키 검증 실패: {e}")
+                                st.session_state.openai_api_key = None
+                                st.session_state.use_ai = False
                     else:
-                        st.session_state.openai_api_key = None
-                        st.session_state.use_ai = False
+                        if len(cleaned_key) > 0:  # 빈 문자열이 아닌 경우만 오류 표시
+                            st.error("❌ 올바른 형식의 API 키가 아닙니다.")
+                            st.info("'sk-' 또는 'sess-'로 시작하는 키를 입력해주세요.")
                 
                 # 현재 상태 표시
                 if st.session_state.use_ai and st.session_state.openai_api_key:
-                    st.info(f"🔑 API 키 설정됨: {st.session_state.openai_api_key[:10]}...")
+                    st.success(f"✅ AI 기능 활성화됨")
+                    if st.button("🔄 API 키 초기화", type="secondary"):
+                        st.session_state.openai_api_key = None
+                        st.session_state.use_ai = False
+                        st.rerun()
                 else:
                     st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
         
@@ -1685,11 +1880,13 @@ def show_sidebar():
         
         # 초기화 버튼
         if st.button("🔄 초기화", type="secondary", use_container_width=True):
-            keys_to_keep = ['mode', 'openai_api_key', 'use_ai', 'oc_code', 'include_pdfs']
+            keys_to_keep = ['mode', 'oc_code', 'include_pdfs']  # API 키는 초기화
             for key in list(st.session_state.keys()):
                 if key not in keys_to_keep:
                     del st.session_state[key]
             st.session_state.file_processed = False
+            st.session_state.openai_api_key = None
+            st.session_state.use_ai = False
             st.rerun()
         
         return oc_code
@@ -1775,7 +1972,7 @@ def handle_file_upload_mode(oc_code: str):
     
     # AI 상태 표시 (수정)
     if st.session_state.use_ai and st.session_state.openai_api_key:
-        st.info(f"🤖 AI 강화 모드 활성화 (API 키: {st.session_state.openai_api_key[:10]}...)")
+        st.info(f"🤖 AI 강화 모드 활성화")
     else:
         st.info("💡 AI 설정을 통해 법령명 추출 정확도를 높일 수 있습니다")
     
@@ -2045,7 +2242,7 @@ def display_collection_stats(collected_laws: Dict[str, Dict[str, Any]]):
 
 
 def display_download_section():
-    """다운로드 섹션 표시 - PDF 포함 옵션 추가"""
+    """다운로드 섹션 표시 - 모든 형식 지원"""
     if not st.session_state.collected_laws:
         return
         
@@ -2092,28 +2289,53 @@ def display_download_section():
             use_container_width=True
         )
     else:
-        # 통합 파일
-        file_format = st.selectbox(
-            "파일 형식 선택",
-            ["JSON", "Markdown", "Text"]
-        )
+        # 통합 파일 - 명확한 형식 선택
+        st.info("📌 단일 파일로 모든 법령을 통합하여 다운로드합니다.")
         
-        format_map = {
-            "JSON": ("json", "application/json", "json"),
-            "Markdown": ("markdown", "text/markdown", "md"),
-            "Text": ("text", "text/plain", "txt")
+        # 형식별 설명 추가
+        format_descriptions = {
+            "JSON": "구조화된 데이터 형식 (프로그래밍 활용에 적합)",
+            "Markdown": "읽기 쉬운 문서 형식 (GitHub, 노션 등에 적합)",
+            "Text": "순수 텍스트 형식 (메모장 등에서 열기 가능)"
         }
         
-        fmt, mime, ext = format_map[file_format]
-        content = exporter.export_single_file(st.session_state.collected_laws, fmt)
+        file_format = st.selectbox(
+            "파일 형식 선택",
+            ["JSON", "Markdown", "Text"],
+            help="다운로드할 파일 형식을 선택하세요"
+        )
+        
+        st.caption(f"💡 {format_descriptions[file_format]}")
+        
+        # 형식별 내보내기 처리
+        if file_format == "JSON":
+            content = exporter.export_single_file(st.session_state.collected_laws, 'json')
+            mime = "application/json"
+            ext = "json"
+        elif file_format == "Markdown":
+            content = exporter.export_single_file(st.session_state.collected_laws, 'markdown')
+            mime = "text/markdown"
+            ext = "md"
+        else:  # Text
+            content = exporter.export_single_file(st.session_state.collected_laws, 'text')
+            mime = "text/plain"
+            ext = "txt"
+        
+        # 파일 크기 표시
+        file_size = len(content.encode('utf-8'))
+        st.caption(f"📊 예상 파일 크기: {file_size:,} bytes")
         
         st.download_button(
-            label=f"💾 {file_format} 통합 파일 다운로드",
+            label=f"💾 {file_format} 통합 파일 다운로드 (.{ext})",
             data=content,
             file_name=f"all_laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}",
             mime=mime,
             use_container_width=True
         )
+        
+        # 미리보기 옵션
+        with st.expander("📄 내용 미리보기 (처음 1000자)"):
+            st.text(content[:1000] + "..." if len(content) > 1000 else content)
     
     # 수집 결과 상세
     with st.expander("📊 수집 결과 상세"):
@@ -2161,7 +2383,7 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.4)")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.5)")
     st.markdown("**✨ 행정규칙 완벽 지원 + PDF 첨부파일 다운로드!**")
     
     # 사이드바
