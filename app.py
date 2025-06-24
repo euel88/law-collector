@@ -48,7 +48,7 @@ class APIConfig:
     # 법제처 API 엔드포인트
     LAW_SEARCH_URL = "https://www.law.go.kr/DRF/lawSearch.do"  # 일반 법령 검색
     LAW_DETAIL_URL = "https://www.law.go.kr/DRF/lawService.do"  # 법령 상세
-    ADMIN_RULE_SEARCH_URL = "ttps://www.law.go.kr/DRF/lawSearch.do"  # 행정규칙 검색
+    ADMIN_RULE_SEARCH_URL = "https://www.law.go.kr/DRF/lawSearch.do"  # 행정규칙 검색
     ADMIN_RULE_DETAIL_URL = "https://www.law.go.kr/DRF/lawService.do"  # 행정규칙도 동일 서비스 사용
     
     # API 설정
