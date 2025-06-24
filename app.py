@@ -1150,68 +1150,124 @@ class LawCollectorAPI:
         # 별표/별지 정보에서 PDF URL 패턴 추출
         law_name = detail['law_name']
         law_msn = detail['law_msn']
-        promulgation_date = detail.get('promulgation_date', '').replace('-', '')
+        promulgation_date = detail.get('promulgation_date', '').replace('-', '').replace('.', '')
+        enforcement_date = detail.get('enforcement_date', '').replace('-', '').replace('.', '')
+        
+        # 법령명에서 괄호 제거 (URL에서 문제 일으킬 수 있음)
+        clean_law_name = re.sub(r'\([^)]*\)', '', law_name).strip()
         
         # 1. XML에서 직접 파일 정보 추출
+        pdf_found = False
         for elem in root.iter():
-            # 파일 링크나 ID 찾기
-            file_seq = elem.findtext('파일순번', '')
-            file_name = elem.findtext('파일명', '')
-            
-            if file_seq and file_name and file_name.lower().endswith('.pdf'):
-                pdf_info = {
-                    'file_seq': file_seq,
-                    'file_name': file_name,
-                    'type': '별표' if '별표' in file_name else '별지',
-                    'url': self._build_pdf_url(law_msn, file_seq)
-                }
-                detail['attachment_pdfs'].append(pdf_info)
-                self.logger.debug(f"PDF 첨부파일 발견: {file_name}")
+            # 파일 관련 태그들 확인
+            if elem.tag in ['첨부파일', '파일', 'file', 'attachment']:
+                file_seq = elem.findtext('파일순번', '') or elem.findtext('순번', '')
+                file_name = elem.findtext('파일명', '') or elem.findtext('명칭', '')
+                file_type = elem.findtext('파일유형', '')
+                
+                if file_name and (file_name.lower().endswith('.pdf') or file_type == 'PDF'):
+                    pdf_info = {
+                        'file_seq': file_seq,
+                        'file_name': file_name,
+                        'type': self._determine_attachment_type(file_name),
+                        'url': self._build_pdf_url(law_msn, file_seq) if file_seq else '',
+                        'direct_url': False
+                    }
+                    detail['attachment_pdfs'].append(pdf_info)
+                    pdf_found = True
+                    self.logger.debug(f"XML에서 PDF 발견: {file_name}")
         
-        # 2. 별표/별지 번호 기반 URL 생성 (대체 방법)
+        # 2. 별표/별지 정보 기반 URL 생성
         if detail['attachments']:
             for attachment in detail['attachments']:
-                # 별표 처리
-                if attachment['type'] == '별표' and attachment['number']:
-                    # 다양한 URL 패턴 시도
-                    pdf_urls = self._build_alternative_pdf_urls(
-                        law_name, '별표', attachment['number'], promulgation_date
-                    )
-                    
-                    pdf_info = {
-                        'file_seq': '',
-                        'file_name': f"{law_name}_별표{attachment['number']}.pdf",
-                        'type': '별표',
-                        'url': pdf_urls[0],  # 기본 URL
-                        'alternative_urls': pdf_urls[1:],  # 대체 URL들
-                        'direct_url': True
-                    }
-                    
-                    # 중복 체크
-                    if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
-                        detail['attachment_pdfs'].append(pdf_info)
-                        self.logger.debug(f"별표 PDF URL 생성: {pdf_urls[0]}")
+                att_type = attachment['type']
+                att_num = attachment['number']
                 
-                # 별지/별첨 처리
-                elif attachment['type'] in ['별지', '별첨'] and attachment['number']:
-                    # 다양한 URL 패턴 시도
-                    pdf_urls = self._build_alternative_pdf_urls(
-                        law_name, '별지', attachment['number'], promulgation_date
-                    )
+                if att_type in ['별표', '별지', '별첨', '서식'] and att_num:
+                    # 여러 날짜 형식 시도
+                    dates_to_try = []
+                    if promulgation_date:
+                        dates_to_try.append(promulgation_date)
+                    if enforcement_date and enforcement_date != promulgation_date:
+                        dates_to_try.append(enforcement_date)
                     
-                    pdf_info = {
-                        'file_seq': '',
-                        'file_name': f"{law_name}_별지{attachment['number']}.pdf",
-                        'type': '별지',
-                        'url': pdf_urls[0],  # 기본 URL
-                        'alternative_urls': pdf_urls[1:],  # 대체 URL들
-                        'direct_url': True
-                    }
+                    # 날짜가 없으면 최근 날짜 사용
+                    if not dates_to_try:
+                        dates_to_try.append(datetime.now().strftime('%Y%m%d'))
                     
-                    # 중복 체크
-                    if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
-                        detail['attachment_pdfs'].append(pdf_info)
-                        self.logger.debug(f"별지 PDF URL 생성: {pdf_urls[0]}")
+                    for date_str in dates_to_try:
+                        pdf_urls = self._build_alternative_pdf_urls(
+                            clean_law_name, 
+                            att_type, 
+                            att_num, 
+                            date_str
+                        )
+                        
+                        pdf_info = {
+                            'file_seq': '',
+                            'file_name': f"{clean_law_name}_{att_type}{att_num}.pdf",
+                            'type': att_type,
+                            'url': pdf_urls[0],
+                            'alternative_urls': pdf_urls[1:],
+                            'direct_url': True,
+                            'date_used': date_str
+                        }
+                        
+                        # 중복 체크 (파일명 기준)
+                        if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
+                            detail['attachment_pdfs'].append(pdf_info)
+                            self.logger.debug(f"{att_type} PDF URL 생성: {pdf_urls[0]}")
+        
+        # 3. 로그 출력
+        if detail['attachment_pdfs']:
+            self.logger.info(f"PDF 첨부파일 {len(detail['attachment_pdfs'])}개 발견: {law_name}")
+        else:
+            self.logger.debug(f"PDF 첨부파일 없음: {law_name}")
+    
+    def _determine_attachment_type(self, filename: str) -> str:
+        """파일명에서 첨부파일 유형 추출"""
+        if '별표' in filename:
+            return '별표'
+        elif '별지' in filename:
+            return '별지'
+        elif '별첨' in filename:
+            return '별첨'
+        elif '서식' in filename:
+            return '서식'
+        else:
+            return '첨부파일'
+    
+    def _build_alternative_pdf_urls(self, law_name: str, attachment_type: str, 
+                                    attachment_number: str, date_str: str) -> List[str]:
+        """다양한 PDF URL 패턴 생성 - 실제 법제처 패턴 반영"""
+        urls = []
+        
+        # URL 안전 문자로 변환
+        import urllib.parse
+        
+        # 1. 법제처 표준 패턴 (가장 일반적)
+        # 예: https://www.law.go.kr/법령별표서식/(여신전문금융업법,20240422,별표1)
+        base_pattern = f"https://www.law.go.kr/법령별표서식/({law_name},{date_str},{attachment_type}{attachment_number})"
+        urls.append(base_pattern)
+        
+        # 2. URL 인코딩된 버전
+        encoded_pattern = f"https://www.law.go.kr/법령별표서식/({urllib.parse.quote(law_name)},{date_str},{urllib.parse.quote(attachment_type)}{attachment_number})"
+        urls.append(encoded_pattern)
+        
+        # 3. 공백 제거 버전
+        no_space_law = law_name.replace(' ', '')
+        no_space_pattern = f"https://www.law.go.kr/법령별표서식/({no_space_law},{date_str},{attachment_type}{attachment_number})"
+        urls.append(no_space_pattern)
+        
+        # 4. 법제처 다운로드 API 패턴
+        download_api = f"https://www.law.go.kr/flDownload.do?type={attachment_type}&flSeq={date_str}_{urllib.parse.quote(law_name)}_{attachment_number}"
+        urls.append(download_api)
+        
+        # 5. 직접 파일 접근 패턴 (구버전)
+        direct_file = f"https://www.law.go.kr/files/{attachment_type}/{date_str[:4]}/{urllib.parse.quote(law_name)}_{attachment_type}{attachment_number}.pdf"
+        urls.append(direct_file)
+        
+        return urls
     
     def _build_pdf_url(self, law_msn: str, file_seq: str) -> str:
         """PDF 다운로드 URL 생성 (기본 API용)"""
@@ -1247,105 +1303,134 @@ class LawCollectorAPI:
         return urls
     
     def download_pdf_attachments(self, law_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """PDF 첨부파일 다운로드 - 개선된 버전"""
+        """PDF 첨부파일 다운로드 - 완전 개선 버전"""
         downloaded_pdfs = []
         
         for pdf_info in law_detail.get('attachment_pdfs', []):
             try:
-                self.logger.info(f"PDF 다운로드 중: {pdf_info['file_name']}")
+                self.logger.info(f"PDF 다운로드 시도: {pdf_info['file_name']}")
                 
-                # 직접 URL인 경우와 일반 URL 구분
+                # 직접 URL인 경우 여러 패턴 시도
                 if pdf_info.get('direct_url'):
-                    # 여러 URL 패턴 시도
                     urls_to_try = [pdf_info['url']] + pdf_info.get('alternative_urls', [])
                     
-                    for url in urls_to_try:
+                    success = False
+                    for attempt, url in enumerate(urls_to_try, 1):
                         try:
-                            # URL 인코딩 처리
-                            import urllib.parse
-                            # 한글 부분만 인코딩
-                            parsed = urllib.parse.urlparse(url)
-                            if '법령별표서식' in parsed.path:
-                                # 특별 처리 필요
-                                encoded_url = url
-                            else:
-                                encoded_url = urllib.parse.quote(url, safe=':/?=&(),%')
+                            self.logger.debug(f"시도 {attempt}/{len(urls_to_try)}: {url}")
                             
+                            # User-Agent 및 헤더 설정
                             headers = {
-                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                                 'Referer': 'https://www.law.go.kr/',
-                                'Accept': 'application/pdf,*/*',
-                                'Accept-Language': 'ko-KR,ko;q=0.9,en;q=0.8',
-                                'Accept-Encoding': 'gzip, deflate, br'
+                                'Accept': 'application/pdf,application/octet-stream,*/*;q=0.9',
+                                'Accept-Language': 'ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'Connection': 'keep-alive',
+                                'Cache-Control': 'no-cache',
+                                'Pragma': 'no-cache'
                             }
                             
+                            # 세션 쿠키 설정
+                            self.session.cookies.set('JSESSIONID', 'dummy', domain='.law.go.kr')
+                            
+                            # GET 요청
                             response = self.session.get(
-                                encoded_url,
+                                url,
                                 headers=headers,
-                                timeout=self.config.TIMEOUT,
+                                timeout=30,
                                 allow_redirects=True,
-                                stream=True
+                                stream=True,
+                                verify=True
                             )
                             
-                            # 성공한 경우
+                            # 응답 확인
                             if response.status_code == 200:
-                                content_type = response.headers.get('Content-Type', '')
+                                content_type = response.headers.get('Content-Type', '').lower()
+                                content_length = int(response.headers.get('Content-Length', 0))
                                 
-                                if 'application/pdf' in content_type or response.content[:4] == b'%PDF':
-                                    pdf_data = {
-                                        'file_name': pdf_info['file_name'],
-                                        'type': pdf_info['type'],
-                                        'content': response.content,
-                                        'size': len(response.content),
-                                        'url_used': url  # 성공한 URL 기록
-                                    }
-                                    downloaded_pdfs.append(pdf_data)
-                                    self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']} ({len(response.content):,} bytes) - URL: {url}")
-                                    break  # 성공했으므로 다른 URL 시도하지 않음
+                                # PDF 확인
+                                if 'pdf' in content_type or content_length > 1000:
+                                    # 전체 컨텐츠 다운로드
+                                    content = b''
+                                    for chunk in response.iter_content(chunk_size=8192):
+                                        if chunk:
+                                            content += chunk
+                                    
+                                    # PDF 시그니처 확인
+                                    if content[:4] == b'%PDF' or b'%PDF' in content[:1024]:
+                                        pdf_data = {
+                                            'file_name': pdf_info['file_name'],
+                                            'type': pdf_info['type'],
+                                            'content': content,
+                                            'size': len(content),
+                                            'url_used': url
+                                        }
+                                        downloaded_pdfs.append(pdf_data)
+                                        self.logger.info(f"✅ PDF 다운로드 성공: {pdf_info['file_name']} ({len(content):,} bytes)")
+                                        success = True
+                                        break
+                                    else:
+                                        self.logger.debug(f"PDF 아님 - 시그니처 불일치")
                                 else:
-                                    self.logger.debug(f"PDF가 아닌 컨텐츠 ({url}): {content_type}")
-                                    continue  # 다음 URL 시도
+                                    self.logger.debug(f"PDF 아님 - Content-Type: {content_type}")
+                            
+                            elif response.status_code == 404:
+                                self.logger.debug(f"404 Not Found: {url}")
                             else:
-                                self.logger.debug(f"다운로드 실패 ({url}): {response.status_code}")
-                                continue  # 다음 URL 시도
+                                self.logger.debug(f"HTTP {response.status_code}: {url}")
                                 
+                        except requests.exceptions.Timeout:
+                            self.logger.debug(f"타임아웃: {url}")
+                        except requests.exceptions.ConnectionError:
+                            self.logger.debug(f"연결 오류: {url}")
                         except Exception as e:
-                            self.logger.debug(f"URL 시도 실패 ({url}): {e}")
-                            continue  # 다음 URL 시도
+                            self.logger.debug(f"예외 발생: {e}")
                     
-                    # 모든 URL 실패한 경우
-                    if not any(pdf['file_name'] == pdf_info['file_name'] for pdf in downloaded_pdfs):
-                        self.logger.warning(f"모든 URL 시도 실패: {pdf_info['file_name']}")
-                        
-                else:
-                    # 일반 다운로드 URL
-                    response = self.session.get(
-                        pdf_info['url'],
-                        timeout=self.config.TIMEOUT,
-                        stream=True
-                    )
-                
-                if response.status_code == 200:
-                    # Content-Type 확인
-                    content_type = response.headers.get('Content-Type', '')
-                    
-                    if 'application/pdf' in content_type or response.content[:4] == b'%PDF':
-                        pdf_data = {
+                    if not success:
+                        self.logger.warning(f"❌ 모든 시도 실패: {pdf_info['file_name']}")
+                        # 실패 정보 기록
+                        failed_info = {
                             'file_name': pdf_info['file_name'],
                             'type': pdf_info['type'],
-                            'content': response.content,
-                            'size': len(response.content)
+                            'content': None,
+                            'size': 0,
+                            'error': 'Download failed after all attempts'
                         }
-                        downloaded_pdfs.append(pdf_data)
-                        self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']} ({len(response.content):,} bytes)")
-                    else:
-                        self.logger.warning(f"PDF가 아닌 컨텐츠: {pdf_info['file_name']} - {content_type}")
+                        # downloaded_pdfs.append(failed_info)  # 실패한 것은 추가하지 않음
+                
                 else:
-                    self.logger.warning(f"PDF 다운로드 실패: {pdf_info['file_name']} - {response.status_code}")
-                    
+                    # API 기반 다운로드
+                    try:
+                        response = self.session.get(
+                            pdf_info['url'],
+                            timeout=30,
+                            stream=True
+                        )
+                        
+                        if response.status_code == 200 and response.content[:4] == b'%PDF':
+                            pdf_data = {
+                                'file_name': pdf_info['file_name'],
+                                'type': pdf_info['type'],
+                                'content': response.content,
+                                'size': len(response.content)
+                            }
+                            downloaded_pdfs.append(pdf_data)
+                            self.logger.info(f"✅ API PDF 다운로드 성공: {pdf_info['file_name']}")
+                        else:
+                            self.logger.warning(f"❌ API PDF 다운로드 실패: {pdf_info['file_name']}")
+                            
+                    except Exception as e:
+                        self.logger.error(f"API PDF 다운로드 오류: {e}")
+                        
             except Exception as e:
                 self.logger.error(f"PDF 다운로드 오류: {pdf_info['file_name']} - {e}")
-                
+        
+        # 결과 요약
+        if downloaded_pdfs:
+            total_size = sum(pdf['size'] for pdf in downloaded_pdfs)
+            self.logger.info(f"📄 총 {len(downloaded_pdfs)}개 PDF 다운로드 완료 (총 {total_size:,} bytes)")
+        
         return downloaded_pdfs
     
     def _extract_full_text(self, root: ET.Element) -> str:
@@ -1761,14 +1846,18 @@ def show_sidebar():
     with st.sidebar:
         st.header("⚙️ 설정")
         
-        # 기관코드 입력
+        # 기관코드 입력 - 고유 키 사용
         oc_code = st.text_input(
             "기관코드 (OC)",
             value=st.session_state.get('oc_code', ''),
             placeholder="이메일 @ 앞부분",
-            help="예: test@korea.kr → test"
+            help="예: test@korea.kr → test",
+            key="sidebar_oc_code"  # 고유 키 추가
         )
-        st.session_state.oc_code = oc_code
+        
+        # 값이 변경되면 세션 상태 업데이트
+        if oc_code != st.session_state.get('oc_code', ''):
+            st.session_state.oc_code = oc_code
         
         st.divider()
         
@@ -1786,65 +1875,64 @@ def show_sidebar():
                 st.info("설치하려면: `pip install openai`")
             
             if openai_available:
-                # API 키 입력 - 개선된 처리
-                api_key = st.text_input(
-                    "OpenAI API Key",
-                    type="password",
-                    value="",  # 항상 빈 값으로 시작
-                    key="openai_key_input",
-                    help="https://platform.openai.com/api-keys 에서 발급",
-                    placeholder="sk-..."
-                )
-                
-                # 실시간 키 업데이트 (버튼 없이)
-                if api_key and api_key != st.session_state.get('openai_api_key', ''):
-                    # 키 정리 및 검증
-                    cleaned_key = api_key.strip()
+                # 현재 API 키 상태 표시
+                if st.session_state.get('use_ai', False) and st.session_state.get('openai_api_key'):
+                    st.success("✅ AI 기능 활성화됨")
+                    st.caption(f"현재 API 키: {st.session_state.openai_api_key[:10]}...")
                     
-                    # 기본 형식 검증
-                    if cleaned_key.startswith(('sk-', 'sess-')) and len(cleaned_key) > 40:
-                        with st.spinner("API 키 검증 중..."):
-                            try:
-                                from openai import OpenAI
-                                # 테스트용 클라이언트 생성
-                                test_client = OpenAI(api_key=cleaned_key)
-                                
-                                # 간단한 테스트 - 모델 목록 조회
-                                test_client.models.list(limit=1)
-                                
-                                # 성공하면 세션에 저장
-                                st.session_state.openai_api_key = cleaned_key
-                                st.session_state.use_ai = True
-                                st.success("✅ API 키가 검증되었습니다!")
-                                logger.info(f"API 키 설정 및 검증 완료: {cleaned_key[:10]}...")
-                                
-                            except Exception as e:
-                                error_msg = str(e)
-                                if "401" in error_msg or "Incorrect API key" in error_msg:
-                                    st.error("❌ API 키가 유효하지 않습니다.")
-                                    st.info("올바른 OpenAI API 키인지 확인해주세요.")
-                                elif "429" in error_msg:
-                                    st.warning("⚠️ API 사용 한도 초과. 나중에 다시 시도해주세요.")
-                                else:
-                                    st.error(f"❌ API 키 검증 실패: {error_msg}")
-                                
-                                logger.error(f"API 키 검증 실패: {e}")
-                                st.session_state.openai_api_key = None
-                                st.session_state.use_ai = False
-                    else:
-                        if len(cleaned_key) > 0:  # 빈 문자열이 아닌 경우만 오류 표시
-                            st.error("❌ 올바른 형식의 API 키가 아닙니다.")
-                            st.info("'sk-' 또는 'sess-'로 시작하는 키를 입력해주세요.")
-                
-                # 현재 상태 표시
-                if st.session_state.use_ai and st.session_state.openai_api_key:
-                    st.success(f"✅ AI 기능 활성화됨")
-                    if st.button("🔄 API 키 초기화", type="secondary"):
+                    if st.button("🔄 API 키 재설정", type="secondary"):
                         st.session_state.openai_api_key = None
                         st.session_state.use_ai = False
                         st.rerun()
                 else:
-                    st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
+                    # API 키 입력
+                    api_key_input = st.text_input(
+                        "OpenAI API Key",
+                        type="password",
+                        value="",
+                        key="openai_key_new_input",  # 고유 키
+                        help="https://platform.openai.com/api-keys 에서 발급",
+                        placeholder="sk-..."
+                    )
+                    
+                    if st.button("🔑 API 키 설정", type="primary"):
+                        if api_key_input:
+                            # 키 정리 및 검증
+                            cleaned_key = api_key_input.strip()
+                            
+                            if cleaned_key.startswith(('sk-', 'sess-')) and len(cleaned_key) > 40:
+                                with st.spinner("API 키 검증 중..."):
+                                    try:
+                                        from openai import OpenAI
+                                        # 테스트용 클라이언트 생성
+                                        test_client = OpenAI(api_key=cleaned_key)
+                                        
+                                        # 간단한 테스트 - 모델 목록 조회
+                                        test_client.models.list(limit=1)
+                                        
+                                        # 성공하면 세션에 저장
+                                        st.session_state.openai_api_key = cleaned_key
+                                        st.session_state.use_ai = True
+                                        st.success("✅ API 키가 검증되었습니다!")
+                                        logger.info(f"API 키 설정 및 검증 완료")
+                                        st.rerun()
+                                        
+                                    except Exception as e:
+                                        error_msg = str(e)
+                                        if "401" in error_msg or "Incorrect API key" in error_msg:
+                                            st.error("❌ API 키가 유효하지 않습니다.")
+                                            st.info("올바른 OpenAI API 키인지 확인해주세요.")
+                                        elif "429" in error_msg:
+                                            st.warning("⚠️ API 사용 한도 초과. 나중에 다시 시도해주세요.")
+                                        else:
+                                            st.error(f"❌ API 키 검증 실패: {error_msg}")
+                                        
+                                        logger.error(f"API 키 검증 실패: {e}")
+                            else:
+                                st.error("❌ 올바른 형식의 API 키가 아닙니다.")
+                                st.info("'sk-' 또는 'sess-'로 시작하는 키를 입력해주세요.")
+                        else:
+                            st.warning("API 키를 입력해주세요.")
         
         st.divider()
         
@@ -1853,9 +1941,12 @@ def show_sidebar():
         include_pdfs = st.checkbox(
             "별표/별첨 PDF 다운로드",
             value=st.session_state.get('include_pdfs', False),
-            help="법령의 별표, 별첨 등이 PDF로 제공되는 경우 함께 다운로드합니다."
+            help="법령의 별표, 별첨 등이 PDF로 제공되는 경우 함께 다운로드합니다.",
+            key="sidebar_include_pdfs"  # 고유 키
         )
-        st.session_state.include_pdfs = include_pdfs
+        
+        if include_pdfs != st.session_state.get('include_pdfs', False):
+            st.session_state.include_pdfs = include_pdfs
         
         st.divider()
         
@@ -1864,7 +1955,8 @@ def show_sidebar():
         mode = st.radio(
             "방식 선택",
             ["직접 검색", "파일 업로드"],
-            help="직접 검색: 법령명을 입력하여 검색\n파일 업로드: 파일에서 법령 추출"
+            help="직접 검색: 법령명을 입력하여 검색\n파일 업로드: 파일에서 법령 추출",
+            key="sidebar_mode"  # 고유 키
         )
         st.session_state.mode = 'direct' if mode == "직접 검색" else 'file'
         
@@ -1873,27 +1965,24 @@ def show_sidebar():
         st.subheader("🧪 테스트")
         
         if st.button("행정규칙 검색 테스트", type="secondary", use_container_width=True):
-            if not oc_code:
+            if not st.session_state.get('oc_code', ''):
                 st.error("기관코드를 먼저 입력해주세요!")
             else:
-                test_admin_rule_search(oc_code)
+                test_admin_rule_search(st.session_state.oc_code)
         
         # 초기화 버튼
         if st.button("🔄 초기화", type="secondary", use_container_width=True):
-            keys_to_keep = ['mode', 'oc_code', 'include_pdfs']  # API 키는 초기화
+            keys_to_keep = ['mode']  # 최소한의 키만 유지
             for key in list(st.session_state.keys()):
                 if key not in keys_to_keep:
                     del st.session_state[key]
-            st.session_state.file_processed = False
-            st.session_state.openai_api_key = None
-            st.session_state.use_ai = False
             st.rerun()
         
-        return oc_code
+        return st.session_state.get('oc_code', '')
 
 
 def test_admin_rule_search(oc_code: str):
-    """행정규칙 검색 테스트"""
+    """행정규칙 검색 테스트 - PDF 디버깅 정보 추가"""
     with st.spinner("행정규칙 검색 테스트 중..."):
         collector = LawCollectorAPI(oc_code)
         
@@ -1915,16 +2004,44 @@ def test_admin_rule_search(oc_code: str):
                     type_emoji = "📋" if item.get('is_admin_rule') else "📖"
                     st.write(f"    {type_emoji} {item['law_name']} ({item['law_type']})")
                     
-                    # PDF 첨부파일 확인
-                    if found and st.session_state.include_pdfs:
-                        detail = collector._get_law_detail(
-                            item['law_id'], 
-                            item['law_msn'], 
-                            item['law_name'], 
-                            item.get('is_admin_rule', False)
-                        )
-                        if detail and detail.get('attachment_pdfs'):
-                            st.info(f"    📄 PDF 첨부파일 {len(detail['attachment_pdfs'])}개 발견")
+                    # PDF 첨부파일 확인 - 상세 테스트
+                    if found and st.session_state.get('include_pdfs', False):
+                        with st.expander(f"PDF 테스트: {item['law_name']}"):
+                            detail = collector._get_law_detail(
+                                item['law_id'], 
+                                item['law_msn'], 
+                                item['law_name'], 
+                                item.get('is_admin_rule', False)
+                            )
+                            if detail:
+                                if detail.get('attachment_pdfs'):
+                                    st.info(f"📄 PDF 발견: {len(detail['attachment_pdfs'])}개")
+                                    
+                                    # PDF 정보 표시
+                                    for pdf in detail['attachment_pdfs']:
+                                        st.write(f"**파일명**: {pdf['file_name']}")
+                                        st.write(f"**유형**: {pdf['type']}")
+                                        st.write(f"**URL**: `{pdf['url']}`")
+                                        
+                                        # 다운로드 테스트
+                                        if st.button(f"다운로드 테스트: {pdf['file_name']}", key=f"test_dl_{pdf['file_name']}"):
+                                            downloaded = collector.download_pdf_attachments({'attachment_pdfs': [pdf]})
+                                            if downloaded:
+                                                st.success(f"✅ 다운로드 성공! ({downloaded[0]['size']:,} bytes)")
+                                            else:
+                                                st.error("❌ 다운로드 실패")
+                                                if pdf.get('alternative_urls'):
+                                                    st.write("대체 URL들:")
+                                                    for alt_url in pdf['alternative_urls']:
+                                                        st.code(alt_url)
+                                else:
+                                    st.warning("📄 PDF 첨부파일 없음")
+                                    
+                                # 별표/별지 정보
+                                if detail.get('attachments'):
+                                    st.write(f"**별표/별지**: {len(detail['attachments'])}개")
+                                    for att in detail['attachments']:
+                                        st.write(f"- {att['type']} {att.get('number', '')}: {att.get('title', '')}")
             else:
                 st.warning(f"❌ 검색 결과 없음")
             
@@ -2167,7 +2284,7 @@ def display_search_results_and_collect(oc_code: str):
 
 
 def collect_selected_laws(oc_code: str):
-    """선택된 법령 수집 - PDF 다운로드 기능 추가"""
+    """선택된 법령 수집 - PDF 다운로드 기능 강화"""
     collector = LawCollectorAPI(oc_code)
     
     progress_bar = st.progress(0)
@@ -2183,19 +2300,46 @@ def collect_selected_laws(oc_code: str):
         )
     
     # PDF 다운로드 (옵션)
-    if st.session_state.include_pdfs:
+    if st.session_state.get('include_pdfs', False):
         status_text.text("PDF 첨부파일 다운로드 중...")
-        pdf_count = 0
         
-        for law_id, law_detail in collected.items():
-            if law_detail.get('attachment_pdfs'):
-                downloaded_pdfs = collector.download_pdf_attachments(law_detail)
-                if downloaded_pdfs:
-                    law_detail['downloaded_pdfs'] = downloaded_pdfs
-                    pdf_count += len(downloaded_pdfs)
-        
-        if pdf_count > 0:
-            st.success(f"📄 {pdf_count}개의 PDF 파일을 다운로드했습니다!")
+        total_pdf_count = sum(len(law.get('attachment_pdfs', [])) for law in collected.values())
+        if total_pdf_count > 0:
+            st.info(f"📄 총 {total_pdf_count}개의 PDF 파일을 찾았습니다. 다운로드를 시작합니다...")
+            
+            pdf_progress = st.progress(0)
+            downloaded_count = 0
+            failed_count = 0
+            
+            for law_idx, (law_id, law_detail) in enumerate(collected.items()):
+                if law_detail.get('attachment_pdfs'):
+                    st.write(f"📖 {law_detail['law_name']}의 PDF 다운로드 중...")
+                    
+                    # PDF 다운로드 시도
+                    downloaded_pdfs = collector.download_pdf_attachments(law_detail)
+                    
+                    if downloaded_pdfs:
+                        law_detail['downloaded_pdfs'] = downloaded_pdfs
+                        downloaded_count += len(downloaded_pdfs)
+                        st.success(f"✅ {len(downloaded_pdfs)}개 다운로드 완료")
+                    else:
+                        failed_count += len(law_detail.get('attachment_pdfs', []))
+                        st.warning(f"⚠️ PDF 다운로드 실패")
+                    
+                    # 진행률 업데이트
+                    pdf_progress.progress((law_idx + 1) / len(collected))
+            
+            # 결과 요약
+            if downloaded_count > 0:
+                st.success(f"📄 총 {downloaded_count}개의 PDF 파일을 다운로드했습니다!")
+            if failed_count > 0:
+                st.warning(f"⚠️ {failed_count}개의 PDF 파일 다운로드에 실패했습니다.")
+                with st.expander("💡 PDF 다운로드 실패 해결 방법"):
+                    st.write("1. 법제처 사이트에서 직접 확인해보세요.")
+                    st.write("2. 별표/별지 번호가 정확한지 확인하세요.")
+                    st.write("3. 최신 개정된 법령의 경우 아직 PDF가 업로드되지 않았을 수 있습니다.")
+        else:
+            st.info("📄 PDF 첨부파일이 없는 법령들입니다.")
     
     progress_bar.progress(1.0)
     
