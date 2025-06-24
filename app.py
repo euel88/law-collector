@@ -1,17 +1,16 @@
 """
-법제처 법령 수집기 - 개선된 버전 (v4.0)
-- 보안 강화: SSL 인증서 검증
-- 성능 개선: 비동기 처리 지원
-- 코드 구조 개선: 설정 분리, 에러 처리 강화
-- Open API 가이드라인 준수
+법제처 법령 수집기 - 수정된 버전 (v4.1)
+- aiohttp import 제거 (사용하지 않음)
+- 필수 라이브러리만 import
+- requirements.txt에 맞춰 수정
 """
 
 import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
 import json
-import asyncio
-import aiohttp
+# import asyncio  # 비동기 처리를 사용하지 않으므로 제거
+# import aiohttp  # 사용하지 않는 import 제거
 from datetime import datetime
 from io import BytesIO
 import zipfile
@@ -24,10 +23,10 @@ from functools import lru_cache
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
-from dotenv import load_dotenv
+# from dotenv import load_dotenv  # requirements.txt에 없으므로 제거
 
-# 환경 변수 로드
-load_dotenv()
+# 환경 변수는 Streamlit Cloud의 Secrets 기능 사용
+# load_dotenv()  # 제거
 
 # 로깅 설정
 logging.basicConfig(level=logging.INFO)
@@ -288,7 +287,12 @@ class EnhancedLawFileExtractor:
     def _enhance_with_ai(self, text: str, laws: Set[str]) -> Set[str]:
         """AI를 활용한 법령명 추출 개선"""
         try:
-            from openai import OpenAI
+            # OpenAI 라이브러리 체크
+            try:
+                from openai import OpenAI
+            except ImportError:
+                self.logger.warning("OpenAI 라이브러리가 설치되지 않았습니다.")
+                return laws
             
             client = OpenAI(api_key=self.api_key)
             
@@ -427,9 +431,9 @@ class LawCollectorAPI:
         # SSL 인증서 검증 활성화 (보안 강화)
         session.verify = True
         
-        # 재시도 설정
+        # 재시도 설정 - urllib3 import 수정
         from requests.adapters import HTTPAdapter
-        from requests.packages.urllib3.util.retry import Retry
+        from urllib3.util.retry import Retry  # 올바른 import 경로
         
         retry_strategy = Retry(
             total=self.config.MAX_RETRIES,
@@ -1128,20 +1132,30 @@ def show_sidebar():
         with st.expander("🤖 AI 설정 (선택사항)", expanded=False):
             st.markdown("**ChatGPT를 사용하여 법령명 추출 정확도를 높입니다**")
             
-            api_key = st.text_input(
-                "OpenAI API Key",
-                type="password",
-                value=st.session_state.get('openai_api_key', ''),
-                help="https://platform.openai.com/api-keys 에서 발급"
-            )
+            # OpenAI 라이브러리 설치 확인
+            try:
+                import openai
+                openai_available = True
+            except ImportError:
+                openai_available = False
+                st.warning("⚠️ OpenAI 라이브러리가 설치되지 않았습니다.")
+                st.info("설치하려면: `pip install openai`")
             
-            if api_key:
-                st.session_state.openai_api_key = api_key
-                st.session_state.use_ai = True
-                st.success("✅ API 키가 설정되었습니다!")
-            else:
-                st.session_state.use_ai = False
-                st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
+            if openai_available:
+                api_key = st.text_input(
+                    "OpenAI API Key",
+                    type="password",
+                    value=st.session_state.get('openai_api_key', ''),
+                    help="https://platform.openai.com/api-keys 에서 발급"
+                )
+                
+                if api_key:
+                    st.session_state.openai_api_key = api_key
+                    st.session_state.use_ai = True
+                    st.success("✅ API 키가 설정되었습니다!")
+                else:
+                    st.session_state.use_ai = False
+                    st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
         
         st.divider()
         
@@ -1477,7 +1491,7 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v4.0)")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v4.1)")
     
     # 사이드바
     oc_code = show_sidebar()
