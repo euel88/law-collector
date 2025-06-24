@@ -1,8 +1,7 @@
 """
-법제처 법령 수집기 - 행정규칙 완벽 수정 (v6.3)
-- 행정규칙 XML 파싱 버그 수정 (admrul 태그 사용)
-- 행정규칙 상세조회 파라미터 수정 (ID 사용)
-- 키워드 추출 개선 (불필요한 접두어 제거)
+법제처 법령 수집기 - 버그 수정 버전 (v6.4)
+- OpenAI API 키 인식 문제 해결
+- 별표/별첨 PDF 다운로드 기능 추가
 - 디버깅 로그 강화
 """
 
@@ -25,6 +24,7 @@ from functools import lru_cache
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import base64
 
 # 로깅 설정
 logging.basicConfig(
@@ -50,6 +50,9 @@ class APIConfig:
     LAW_DETAIL_URL = "https://www.law.go.kr/DRF/lawService.do"  # 법령 상세
     ADMIN_RULE_SEARCH_URL = "https://www.law.go.kr/DRF/lawSearch.do"  # 행정규칙 검색
     ADMIN_RULE_DETAIL_URL = "https://www.law.go.kr/DRF/lawService.do"  # 행정규칙도 동일 서비스 사용
+    
+    # PDF 다운로드 URL 패턴
+    PDF_DOWNLOAD_URL = "https://www.law.go.kr/flDownload.do"
     
     # API 설정
     DEFAULT_DELAY = 0.3  # API 호출 간격 (초)
@@ -335,7 +338,7 @@ class EnhancedLawFileExtractor:
         return processed
     
     def _enhance_with_ai(self, text: str, laws: Set[str]) -> Set[str]:
-        """AI를 활용한 법령명 추출 개선"""
+        """AI를 활용한 법령명 추출 개선 - 수정된 버전"""
         try:
             # OpenAI 라이브러리 체크
             try:
@@ -344,11 +347,19 @@ class EnhancedLawFileExtractor:
                 self.logger.warning("OpenAI 라이브러리가 설치되지 않았습니다.")
                 return laws
             
-            # API 키 유효성 검증
-            if not self.api_key or not self.api_key.startswith('sk-'):
-                self.logger.warning("유효하지 않은 OpenAI API 키")
+            # API 키 유효성 검증 - 더 상세한 로깅
+            if not self.api_key:
+                self.logger.warning("API 키가 설정되지 않았습니다.")
                 return laws
             
+            # API 키 형식 검증 개선
+            if not self.api_key.startswith(('sk-', 'sess-')):
+                self.logger.warning(f"유효하지 않은 API 키 형식: {self.api_key[:10]}...")
+                return laws
+            
+            self.logger.info(f"OpenAI API 키 사용 중: {self.api_key[:10]}...")
+            
+            # OpenAI 클라이언트 생성
             client = OpenAI(api_key=self.api_key)
             
             # 텍스트 샘플링 (토큰 제한)
@@ -372,12 +383,14 @@ class EnhancedLawFileExtractor:
                 # 응답 파싱
                 ai_laws = self._parse_ai_response(response.choices[0].message.content)
                 
+                self.logger.info(f"AI가 추가로 {len(ai_laws - laws)}개의 법령을 찾았습니다.")
+                
                 # 결과 병합
                 return laws.union(ai_laws)
                 
             except Exception as api_error:
                 self.logger.error(f"OpenAI API 호출 오류: {api_error}")
-                st.warning("AI 기능을 사용할 수 없습니다. 기본 추출 결과를 사용합니다.")
+                st.warning(f"AI 기능 오류: {str(api_error)}")
                 return laws
             
         except Exception as e:
@@ -893,6 +906,7 @@ class LawCollectorAPI:
             'articles': [],
             'supplementary_provisions': [],
             'attachments': [],
+            'attachment_pdfs': [],  # PDF 첨부파일 추가
             'raw_content': '',
             'is_admin_rule': False
         }
@@ -921,11 +935,14 @@ class LawCollectorAPI:
             # 별표 추출
             self._extract_attachments(root, detail)
             
+            # PDF 첨부파일 추출 (새로운 기능)
+            self._extract_pdf_attachments(root, detail)
+            
             # 원문 저장 (조문이 없는 경우)
             if not detail['articles']:
                 detail['raw_content'] = self._extract_full_text(root)
                 
-            self.logger.info(f"상세 정보 파싱 완료: {law_name} - 조문 {len(detail['articles'])}개")
+            self.logger.info(f"상세 정보 파싱 완료: {law_name} - 조문 {len(detail['articles'])}개, PDF {len(detail['attachment_pdfs'])}개")
                 
         except Exception as e:
             self.logger.error(f"상세 정보 파싱 오류: {e}")
@@ -946,6 +963,7 @@ class LawCollectorAPI:
             'articles': [],
             'supplementary_provisions': [],
             'attachments': [],
+            'attachment_pdfs': [],  # PDF 첨부파일 추가
             'raw_content': '',
             'is_admin_rule': True
         }
@@ -982,11 +1000,14 @@ class LawCollectorAPI:
             # 별표 추출
             self._extract_attachments(root, detail)
             
+            # PDF 첨부파일 추출 (새로운 기능)
+            self._extract_pdf_attachments(root, detail)
+            
             # 원문 저장
             if not detail['articles']:
                 detail['raw_content'] = self._extract_full_text(root)
                 
-            self.logger.info(f"행정규칙 상세 파싱 완료: {law_name} - 조문 {len(detail['articles'])}개")
+            self.logger.info(f"행정규칙 상세 파싱 완료: {law_name} - 조문 {len(detail['articles'])}개, PDF {len(detail['attachment_pdfs'])}개")
                 
         except Exception as e:
             self.logger.error(f"행정규칙 상세 파싱 오류: {e}")
@@ -1106,6 +1127,58 @@ class LawCollectorAPI:
             if attachment['content'] or attachment['title']:
                 detail['attachments'].append(attachment)
     
+    def _extract_pdf_attachments(self, root: ET.Element, detail: Dict[str, Any]) -> None:
+        """PDF 첨부파일 추출 - 새로운 메서드"""
+        # 별표/별지 PDF 파일 검색
+        for elem in root.iter():
+            # 파일 링크나 ID 찾기
+            file_seq = elem.findtext('파일순번', '')
+            file_name = elem.findtext('파일명', '')
+            
+            if file_seq and file_name and file_name.lower().endswith('.pdf'):
+                pdf_info = {
+                    'file_seq': file_seq,
+                    'file_name': file_name,
+                    'type': '별표' if '별표' in file_name else '별지',
+                    'url': self._build_pdf_url(detail['law_msn'], file_seq)
+                }
+                detail['attachment_pdfs'].append(pdf_info)
+                self.logger.debug(f"PDF 첨부파일 발견: {file_name}")
+    
+    def _build_pdf_url(self, law_msn: str, file_seq: str) -> str:
+        """PDF 다운로드 URL 생성"""
+        # 법제처 PDF 다운로드 URL 패턴
+        return f"{self.config.PDF_DOWNLOAD_URL}?flSeq={file_seq}&flNm=&type=ATTACHED_FILE&lawSeq={law_msn}"
+    
+    def download_pdf_attachments(self, law_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """PDF 첨부파일 다운로드 - 새로운 메서드"""
+        downloaded_pdfs = []
+        
+        for pdf_info in law_detail.get('attachment_pdfs', []):
+            try:
+                self.logger.info(f"PDF 다운로드 중: {pdf_info['file_name']}")
+                
+                response = self.session.get(
+                    pdf_info['url'],
+                    timeout=self.config.TIMEOUT
+                )
+                
+                if response.status_code == 200:
+                    pdf_data = {
+                        'file_name': pdf_info['file_name'],
+                        'type': pdf_info['type'],
+                        'content': response.content
+                    }
+                    downloaded_pdfs.append(pdf_data)
+                    self.logger.info(f"PDF 다운로드 성공: {pdf_info['file_name']}")
+                else:
+                    self.logger.warning(f"PDF 다운로드 실패: {pdf_info['file_name']} - {response.status_code}")
+                    
+            except Exception as e:
+                self.logger.error(f"PDF 다운로드 오류: {pdf_info['file_name']} - {e}")
+                
+        return downloaded_pdfs
+    
     def _extract_full_text(self, root: ET.Element) -> str:
         """전체 텍스트 추출"""
         return self._get_all_text(root)
@@ -1143,13 +1216,14 @@ class LawCollectorAPI:
 
 # ===== 법령 내보내기 클래스 =====
 class LawExporter:
-    """법령 내보내기 클래스"""
+    """법령 내보내기 클래스 - PDF 지원 추가"""
     
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
     
-    def export_to_zip(self, laws_dict: Dict[str, Dict[str, Any]]) -> bytes:
-        """ZIP 파일로 내보내기"""
+    def export_to_zip(self, laws_dict: Dict[str, Dict[str, Any]], 
+                     include_pdfs: bool = False) -> bytes:
+        """ZIP 파일로 내보내기 - PDF 포함 옵션 추가"""
         zip_buffer = BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
@@ -1158,6 +1232,7 @@ class LawExporter:
                 'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 'total_laws': len(laws_dict),
                 'admin_rule_count': sum(1 for law in laws_dict.values() if law.get('is_admin_rule', False)),
+                'pdf_count': sum(len(law.get('attachment_pdfs', [])) for law in laws_dict.values()),
                 'laws': laws_dict
             }
             
@@ -1188,9 +1263,18 @@ class LawExporter:
                 # Markdown
                 md_content = self._format_law_markdown(law)
                 zip_file.writestr(f'laws/{safe_name}.md', md_content)
+                
+                # PDF 첨부파일 (옵션)
+                if include_pdfs and law.get('downloaded_pdfs'):
+                    for pdf in law['downloaded_pdfs']:
+                        pdf_name = self._sanitize_filename(pdf['file_name'])
+                        zip_file.writestr(
+                            f'laws/{safe_name}/attachments/{pdf_name}',
+                            pdf['content']
+                        )
             
             # README
-            readme = self._create_readme(laws_dict)
+            readme = self._create_readme(laws_dict, include_pdfs)
             zip_file.writestr('README.md', readme)
         
         zip_buffer.seek(0)
@@ -1250,6 +1334,11 @@ class LawExporter:
             lines.append(f"소관부처: {law.get('department', '')}")
         lines.append(f"공포일자: {law.get('promulgation_date', '')}")
         lines.append(f"시행일자: {law.get('enforcement_date', '')}")
+        
+        # PDF 첨부파일 정보
+        if law.get('attachment_pdfs'):
+            lines.append(f"PDF 첨부파일: {len(law['attachment_pdfs'])}개")
+        
         lines.append("-" * 60)
         
         # 조문
@@ -1281,6 +1370,12 @@ class LawExporter:
                 lines.append(attachment['content'])
                 lines.append("")
         
+        # PDF 첨부파일 목록
+        if law.get('attachment_pdfs'):
+            lines.append("\n【PDF 첨부파일】\n")
+            for pdf in law['attachment_pdfs']:
+                lines.append(f"- {pdf['file_name']} ({pdf['type']})")
+        
         # 원문 (조문이 없는 경우)
         if not law.get('articles') and law.get('raw_content'):
             lines.append("\n【원 문】\n")
@@ -1302,6 +1397,11 @@ class LawExporter:
             lines.append(f"- **소관부처**: {law.get('department', '')}")
         lines.append(f"- **공포일자**: {law.get('promulgation_date', '')}")
         lines.append(f"- **시행일자**: {law.get('enforcement_date', '')}")
+        
+        # PDF 첨부파일 정보
+        if law.get('attachment_pdfs'):
+            lines.append(f"- **PDF 첨부파일**: {len(law['attachment_pdfs'])}개")
+        
         lines.append("")
         
         # 조문
@@ -1335,6 +1435,17 @@ class LawExporter:
                 lines.append(attachment['content'])
                 lines.append("")
         
+        # PDF 첨부파일
+        if law.get('attachment_pdfs'):
+            lines.append("## 📄 PDF 첨부파일\n")
+            for pdf in law['attachment_pdfs']:
+                lines.append(f"- **{pdf['file_name']}** ({pdf['type']})")
+                if law.get('downloaded_pdfs'):
+                    lines.append("  - ✅ 다운로드 완료")
+                else:
+                    lines.append("  - ⏳ 미다운로드")
+            lines.append("")
+        
         return '\n'.join(lines)
     
     def _create_all_laws_markdown(self, laws_dict: Dict[str, Dict[str, Any]]) -> str:
@@ -1348,8 +1459,12 @@ class LawExporter:
         
         # 통계
         admin_rule_count = sum(1 for law in laws_dict.values() if law.get('is_admin_rule', False))
+        pdf_count = sum(len(law.get('attachment_pdfs', [])) for law in laws_dict.values())
+        
         if admin_rule_count > 0:
             lines.append(f"**행정규칙 수**: {admin_rule_count}개")
+        if pdf_count > 0:
+            lines.append(f"**PDF 첨부파일 총계**: {pdf_count}개")
         
         lines.append("")
         
@@ -1358,7 +1473,8 @@ class LawExporter:
         for idx, (law_id, law) in enumerate(laws_dict.items(), 1):
             anchor = self._sanitize_filename(law['law_name'])
             type_emoji = "📋" if law.get('is_admin_rule', False) else "📖"
-            lines.append(f"{idx}. {type_emoji} [{law['law_name']}](#{anchor})")
+            pdf_mark = " 📄" if law.get('attachment_pdfs') else ""
+            lines.append(f"{idx}. {type_emoji} [{law['law_name']}](#{anchor}){pdf_mark}")
         lines.append("\n---\n")
         
         # 각 법령
@@ -1368,13 +1484,15 @@ class LawExporter:
             
         return '\n'.join(lines)
     
-    def _create_readme(self, laws_dict: Dict[str, Dict[str, Any]]) -> str:
+    def _create_readme(self, laws_dict: Dict[str, Dict[str, Any]], 
+                      include_pdfs: bool = False) -> str:
         """README 생성"""
         # 통계 계산
         total_articles = sum(len(law.get('articles', [])) for law in laws_dict.values())
         total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in laws_dict.values())
         total_attachments = sum(len(law.get('attachments', [])) for law in laws_dict.values())
         admin_rule_count = sum(1 for law in laws_dict.values() if law.get('is_admin_rule', False))
+        pdf_count = sum(len(law.get('attachment_pdfs', [])) for law in laws_dict.values())
         
         content = f"""# 법령 수집 결과
 
@@ -1388,7 +1506,13 @@ class LawExporter:
 - `laws/`: 개별 법령 파일
   - `*.json`: 법령별 상세 데이터
   - `*.txt`: 법령별 텍스트
-  - `*.md`: 법령별 Markdown
+  - `*.md`: 법령별 Markdown"""
+
+        if include_pdfs and pdf_count > 0:
+            content += """
+  - `*/attachments/`: PDF 첨부파일 (별표/별첨)"""
+
+        content += f"""
 - `README.md`: 이 파일
 
 ## 📊 통계
@@ -1397,6 +1521,7 @@ class LawExporter:
 - 총 부칙 수: {total_provisions}개
 - 총 별표/별첨 수: {total_attachments}개
 - 행정규칙 수: {admin_rule_count}개
+- PDF 첨부파일: {pdf_count}개
 
 ## 📖 수집된 법령 목록
 
@@ -1419,7 +1544,10 @@ class LawExporter:
                 content += f"#### {law['law_name']}\n"
                 content += f"- 법종구분: {law.get('law_type', '')}\n"
                 content += f"- 시행일자: {law.get('enforcement_date', '')}\n"
-                content += f"- 조문: {len(law.get('articles', []))}개\n\n"
+                content += f"- 조문: {len(law.get('articles', []))}개\n"
+                if law.get('attachment_pdfs'):
+                    content += f"- PDF 첨부: {len(law['attachment_pdfs'])}개\n"
+                content += "\n"
         
         # 행정규칙 목록
         if admin_rules:
@@ -1430,7 +1558,10 @@ class LawExporter:
                 if law.get('department'):
                     content += f"- 소관부처: {law.get('department', '')}\n"
                 content += f"- 시행일자: {law.get('enforcement_date', '')}\n"
-                content += f"- 조문: {len(law.get('articles', []))}개\n\n"
+                content += f"- 조문: {len(law.get('articles', []))}개\n"
+                if law.get('attachment_pdfs'):
+                    content += f"- PDF 첨부: {len(law['attachment_pdfs'])}개\n"
+                content += "\n"
             
         return content
 
@@ -1447,7 +1578,8 @@ def initialize_session_state():
         'file_processed': False,
         'openai_api_key': None,
         'use_ai': False,
-        'oc_code': ''
+        'oc_code': '',
+        'include_pdfs': False  # PDF 다운로드 옵션
     }
     
     for key, value in defaults.items():
@@ -1471,7 +1603,7 @@ def show_sidebar():
         
         st.divider()
         
-        # AI 설정 (사이드바 직접 입력 방식 유지)
+        # AI 설정 (수정된 부분)
         with st.expander("🤖 AI 설정 (선택사항)", expanded=False):
             st.markdown("**ChatGPT를 사용하여 법령명 추출 정확도를 높입니다**")
             
@@ -1485,26 +1617,50 @@ def show_sidebar():
                 st.info("설치하려면: `pip install openai`")
             
             if openai_available:
-                # 직접 입력 방식
+                # API 키 입력 (수정: 세션 상태 관리 개선)
+                current_key = st.session_state.get('openai_api_key', '')
+                
                 api_key = st.text_input(
                     "OpenAI API Key",
                     type="password",
-                    value=st.session_state.get('openai_api_key', ''),
+                    value=current_key,
+                    key="openai_key_input",
                     help="https://platform.openai.com/api-keys 에서 발급"
                 )
                 
-                if api_key:
-                    # 간단한 유효성 검증
-                    if api_key.startswith('sk-') and len(api_key) > 20:
-                        st.session_state.openai_api_key = api_key
-                        st.session_state.use_ai = True
-                        st.success("✅ API 키가 설정되었습니다!")
+                # 키 변경 감지 및 저장
+                if api_key != current_key:
+                    if api_key:
+                        # 키 유효성 검증
+                        if api_key.startswith(('sk-', 'sess-')) and len(api_key) > 20:
+                            st.session_state.openai_api_key = api_key
+                            st.session_state.use_ai = True
+                            st.success("✅ API 키가 설정되었습니다!")
+                            logger.info(f"API 키 설정됨: {api_key[:10]}...")
+                        else:
+                            st.error("❌ 올바른 형식의 API 키가 아닙니다.")
+                            st.session_state.openai_api_key = None
+                            st.session_state.use_ai = False
                     else:
-                        st.error("❌ 올바른 형식의 API 키가 아닙니다.")
+                        st.session_state.openai_api_key = None
                         st.session_state.use_ai = False
+                
+                # 현재 상태 표시
+                if st.session_state.use_ai and st.session_state.openai_api_key:
+                    st.info(f"🔑 API 키 설정됨: {st.session_state.openai_api_key[:10]}...")
                 else:
-                    st.session_state.use_ai = False
                     st.info("💡 API 키를 입력하면 더 정확한 법령명 추출이 가능합니다.")
+        
+        st.divider()
+        
+        # PDF 다운로드 옵션
+        st.subheader("📄 PDF 옵션")
+        include_pdfs = st.checkbox(
+            "별표/별첨 PDF 다운로드",
+            value=st.session_state.get('include_pdfs', False),
+            help="법령의 별표, 별첨 등이 PDF로 제공되는 경우 함께 다운로드합니다."
+        )
+        st.session_state.include_pdfs = include_pdfs
         
         st.divider()
         
@@ -1529,7 +1685,7 @@ def show_sidebar():
         
         # 초기화 버튼
         if st.button("🔄 초기화", type="secondary", use_container_width=True):
-            keys_to_keep = ['mode', 'openai_api_key', 'use_ai', 'oc_code']
+            keys_to_keep = ['mode', 'openai_api_key', 'use_ai', 'oc_code', 'include_pdfs']
             for key in list(st.session_state.keys()):
                 if key not in keys_to_keep:
                     del st.session_state[key]
@@ -1540,7 +1696,7 @@ def show_sidebar():
 
 
 def test_admin_rule_search(oc_code: str):
-    """행정규칙 검색 테스트 - 개선된 버전"""
+    """행정규칙 검색 테스트"""
     with st.spinner("행정규칙 검색 테스트 중..."):
         collector = LawCollectorAPI(oc_code)
         
@@ -1554,54 +1710,26 @@ def test_admin_rule_search(oc_code: str):
         for rule_name in test_rules:
             st.write(f"\n🔍 검색 중: {rule_name}")
             
-            # 직접 API 호출로 디버깅
-            import requests
-            
-            # 일반 법령으로 검색
-            params1 = {
-                'OC': oc_code,
-                'target': 'law',
-                'type': 'XML',
-                'query': rule_name,
-                'display': '10',
-                'page': '1'
-            }
-            
-            # 행정규칙으로 검색
-            params2 = {
-                'OC': oc_code,
-                'target': 'admrul',
-                'type': 'XML',
-                'query': rule_name,
-                'display': '10',
-                'page': '1'
-            }
-            
-            try:
-                # 일반 법령 API
-                resp1 = requests.get("https://www.law.go.kr/DRF/lawSearch.do", params=params1)
-                st.write(f"  - 일반 법령 API 결과: {resp1.status_code}")
-                
-                # 행정규칙 API
-                resp2 = requests.get("https://www.law.go.kr/DRF/admRulSc.do", params=params2)
-                st.write(f"  - 행정규칙 API 결과: {resp2.status_code}")
-                
-                # XML 응답 샘플 표시
-                if resp2.status_code == 200 and resp2.text:
-                    st.code(resp2.text[:300] + "...", language="xml")
-                
-                # 실제 검색 메서드 테스트
-                found = collector.search_single_law(rule_name)
-                if found:
-                    st.success(f"✅ {len(found)}개 발견!")
-                    for item in found:
-                        type_emoji = "📋" if item.get('is_admin_rule') else "📖"
-                        st.write(f"    {type_emoji} {item['law_name']} ({item['law_type']})")
-                else:
-                    st.warning(f"❌ 검색 결과 없음")
+            # 실제 검색 메서드 테스트
+            found = collector.search_single_law(rule_name)
+            if found:
+                st.success(f"✅ {len(found)}개 발견!")
+                for item in found:
+                    type_emoji = "📋" if item.get('is_admin_rule') else "📖"
+                    st.write(f"    {type_emoji} {item['law_name']} ({item['law_type']})")
                     
-            except Exception as e:
-                st.error(f"오류: {e}")
+                    # PDF 첨부파일 확인
+                    if found and st.session_state.include_pdfs:
+                        detail = collector._get_law_detail(
+                            item['law_id'], 
+                            item['law_msn'], 
+                            item['law_name'], 
+                            item.get('is_admin_rule', False)
+                        )
+                        if detail and detail.get('attachment_pdfs'):
+                            st.info(f"    📄 PDF 첨부파일 {len(detail['attachment_pdfs'])}개 발견")
+            else:
+                st.warning(f"❌ 검색 결과 없음")
             
             time.sleep(0.5)
 
@@ -1645,9 +1773,9 @@ def handle_file_upload_mode(oc_code: str):
     """파일 업로드 모드 처리"""
     st.header("📄 파일 업로드 모드")
     
-    # AI 상태 표시
-    if st.session_state.use_ai:
-        st.info("🤖 AI 강화 모드가 활성화되었습니다")
+    # AI 상태 표시 (수정)
+    if st.session_state.use_ai and st.session_state.openai_api_key:
+        st.info(f"🤖 AI 강화 모드 활성화 (API 키: {st.session_state.openai_api_key[:10]}...)")
     else:
         st.info("💡 AI 설정을 통해 법령명 추출 정확도를 높일 수 있습니다")
     
@@ -1661,6 +1789,10 @@ def handle_file_upload_mode(oc_code: str):
         st.subheader("📋 STEP 1: 법령명 추출")
         
         with st.spinner("파일에서 법령명을 추출하는 중..."):
+            # API 키 전달 확인
+            logger.info(f"AI 사용 여부: {st.session_state.use_ai}")
+            logger.info(f"API 키 존재: {bool(st.session_state.openai_api_key)}")
+            
             extractor = EnhancedLawFileExtractor(
                 use_ai=st.session_state.use_ai,
                 api_key=st.session_state.openai_api_key
@@ -1680,6 +1812,7 @@ def handle_file_upload_mode(oc_code: str):
                     
             except Exception as e:
                 st.error(f"파일 처리 오류: {str(e)}")
+                logger.error(f"파일 처리 오류: {e}", exc_info=True)
     
     # 추출된 법령 표시
     if st.session_state.extracted_laws:
@@ -1837,7 +1970,7 @@ def display_search_results_and_collect(oc_code: str):
 
 
 def collect_selected_laws(oc_code: str):
-    """선택된 법령 수집"""
+    """선택된 법령 수집 - PDF 다운로드 기능 추가"""
     collector = LawCollectorAPI(oc_code)
     
     progress_bar = st.progress(0)
@@ -1851,6 +1984,21 @@ def collect_selected_laws(oc_code: str):
             st.session_state.selected_laws,
             progress_callback=update_progress
         )
+    
+    # PDF 다운로드 (옵션)
+    if st.session_state.include_pdfs:
+        status_text.text("PDF 첨부파일 다운로드 중...")
+        pdf_count = 0
+        
+        for law_id, law_detail in collected.items():
+            if law_detail.get('attachment_pdfs'):
+                downloaded_pdfs = collector.download_pdf_attachments(law_detail)
+                if downloaded_pdfs:
+                    law_detail['downloaded_pdfs'] = downloaded_pdfs
+                    pdf_count += len(downloaded_pdfs)
+        
+        if pdf_count > 0:
+            st.success(f"📄 {pdf_count}개의 PDF 파일을 다운로드했습니다!")
     
     progress_bar.progress(1.0)
     
@@ -1872,13 +2020,15 @@ def collect_selected_laws(oc_code: str):
 
 
 def display_collection_stats(collected_laws: Dict[str, Dict[str, Any]]):
-    """수집 통계 표시"""
+    """수집 통계 표시 - PDF 통계 추가"""
     total_articles = sum(len(law.get('articles', [])) for law in collected_laws.values())
     total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in collected_laws.values())
     total_attachments = sum(len(law.get('attachments', [])) for law in collected_laws.values())
     admin_rule_count = sum(1 for law in collected_laws.values() if law.get('is_admin_rule', False))
+    pdf_count = sum(len(law.get('attachment_pdfs', [])) for law in collected_laws.values())
+    downloaded_pdf_count = sum(len(law.get('downloaded_pdfs', [])) for law in collected_laws.values())
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         st.metric("총 조문", f"{total_articles:,}개")
     with col2:
@@ -1887,10 +2037,15 @@ def display_collection_stats(collected_laws: Dict[str, Dict[str, Any]]):
         st.metric("총 별표/별첨", f"{total_attachments}개")
     with col4:
         st.metric("행정규칙", f"{admin_rule_count}개")
+    with col5:
+        if st.session_state.include_pdfs:
+            st.metric("PDF 다운로드", f"{downloaded_pdf_count}/{pdf_count}개")
+        else:
+            st.metric("PDF 발견", f"{pdf_count}개")
 
 
 def display_download_section():
-    """다운로드 섹션 표시"""
+    """다운로드 섹션 표시 - PDF 포함 옵션 추가"""
     if not st.session_state.collected_laws:
         return
         
@@ -1908,10 +2063,29 @@ def display_download_section():
     
     if download_option == "개별 파일 (ZIP)":
         # ZIP 다운로드
-        zip_data = exporter.export_to_zip(st.session_state.collected_laws)
+        include_pdfs_in_zip = False
+        if st.session_state.include_pdfs:
+            pdf_count = sum(len(law.get('downloaded_pdfs', [])) for law in st.session_state.collected_laws.values())
+            if pdf_count > 0:
+                include_pdfs_in_zip = st.checkbox(
+                    f"ZIP에 PDF 파일 포함 ({pdf_count}개)",
+                    value=True,
+                    help="다운로드한 PDF 파일을 ZIP에 포함합니다"
+                )
+        
+        zip_data = exporter.export_to_zip(
+            st.session_state.collected_laws,
+            include_pdfs=include_pdfs_in_zip
+        )
+        
+        label = "📦 ZIP 다운로드 (JSON+TXT+MD"
+        if include_pdfs_in_zip:
+            label += "+PDF)"
+        else:
+            label += ")"
         
         st.download_button(
-            label="📦 ZIP 다운로드 (JSON+TXT+MD)",
+            label=label,
             data=zip_data,
             file_name=f"laws_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
             mime="application/zip",
@@ -1947,13 +2121,23 @@ def display_download_section():
             emoji = "📋" if law.get('is_admin_rule', False) else "📖"
             st.subheader(f"{emoji} {law['law_name']}")
             
-            col1, col2, col3 = st.columns(3)
+            col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.write(f"조문: {len(law.get('articles', []))}개")
             with col2:
                 st.write(f"부칙: {len(law.get('supplementary_provisions', []))}개")
             with col3:
                 st.write(f"별표: {len(law.get('attachments', []))}개")
+            with col4:
+                pdf_info = ""
+                if law.get('attachment_pdfs'):
+                    pdf_count = len(law.get('attachment_pdfs', []))
+                    downloaded = len(law.get('downloaded_pdfs', []))
+                    if downloaded > 0:
+                        pdf_info = f"PDF: {downloaded}/{pdf_count}개 ✅"
+                    else:
+                        pdf_info = f"PDF: {pdf_count}개 ⏳"
+                    st.write(pdf_info)
             
             # 샘플 조문
             if law.get('articles'):
@@ -1961,6 +2145,13 @@ def display_download_section():
                 sample = law['articles'][0]
                 st.text(f"{sample['number']} {sample.get('title', '')}")
                 st.text(sample['content'][:200] + "...")
+            
+            # PDF 목록
+            if law.get('attachment_pdfs'):
+                st.write("**PDF 첨부파일:**")
+                for pdf in law['attachment_pdfs']:
+                    status = "✅" if law.get('downloaded_pdfs') else "⏳"
+                    st.write(f"  - {pdf['file_name']} {status}")
 
 
 def main():
@@ -1970,8 +2161,8 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.3)")
-    st.markdown("**✨ 행정규칙(규정, 고시, 훈령 등) 완벽 지원!**")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.4)")
+    st.markdown("**✨ 행정규칙 완벽 지원 + PDF 첨부파일 다운로드!**")
     
     # 사이드바
     oc_code = show_sidebar()
