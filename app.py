@@ -1,7 +1,7 @@
 """
-법제처 법령 수집기 - 버그 수정 완료 (v6.1)
+법제처 법령 수집기 - 버그 수정 완료 (v6.2)
 - OpenAI API 키 사이드바 직접 입력 방식 유지
-- 행정규칙 API URL 수정
+- 행정규칙 API URL 사용 오류 수정 (핵심 수정사항)
 - 접근성 경고 해결
 - 보안 강화
 """
@@ -487,7 +487,7 @@ class LawCollectorAPI:
         return session
     
     def search_laws(self, law_names: List[str], 
-                   progress_callback=None) -> List[Dict[str, Any]]:
+                    progress_callback=None) -> List[Dict[str, Any]]:
         """여러 법령을 병렬로 검색"""
         results = []
         no_result_laws = []
@@ -634,7 +634,8 @@ class LawCollectorAPI:
             
             # 먼저 일반 법령 검색 API로 시도 (행정규칙도 포함될 수 있음)
             response = self.session.get(
-                self.config.LAW_SEARCH_URL,
+                # ✅ [수정됨] 행정규칙 검색을 위한 올바른 URL 사용
+                self.config.ADMIN_RULE_SEARCH_URL,
                 params=params,
                 timeout=self.config.TIMEOUT
             )
@@ -667,7 +668,8 @@ class LawCollectorAPI:
         
         try:
             response = self.session.get(
-                self.config.LAW_SEARCH_URL,
+                # ✅ [수정됨] 행정규칙 검색을 위한 올바른 URL 사용
+                self.config.ADMIN_RULE_SEARCH_URL,
                 params=params,
                 timeout=self.config.TIMEOUT
             )
@@ -687,7 +689,7 @@ class LawCollectorAPI:
             return []
     
     def _parse_admin_rule_from_law_api(self, content: str, 
-                                      search_query: str) -> List[Dict[str, Any]]:
+                                       search_query: str) -> List[Dict[str, Any]]:
         """일반 법령 API 응답에서 행정규칙 파싱"""
         rules = []
         
@@ -727,7 +729,7 @@ class LawCollectorAPI:
         return rules
     
     def _parse_law_search_response(self, content: str, 
-                                  search_query: str) -> List[Dict[str, Any]]:
+                                   search_query: str) -> List[Dict[str, Any]]:
         """법령 검색 응답 파싱"""
         laws = []
         
@@ -774,7 +776,7 @@ class LawCollectorAPI:
         return content
     
     def collect_law_details(self, laws: List[Dict[str, Any]], 
-                           progress_callback=None) -> Dict[str, Dict[str, Any]]:
+                            progress_callback=None) -> Dict[str, Dict[str, Any]]:
         """법령 상세 정보 병렬 수집"""
         collected = {}
         
@@ -809,13 +811,13 @@ class LawCollectorAPI:
         return collected
     
     def _get_law_detail(self, law_id: str, law_msn: str, 
-                       law_name: str, is_admin_rule: bool) -> Optional[Dict[str, Any]]:
+                        law_name: str, is_admin_rule: bool) -> Optional[Dict[str, Any]]:
         """법령 상세 정보 가져오기"""
         # 행정규칙도 일반 법령과 동일한 방식으로 처리
         return self._get_general_law_detail(law_id, law_msn, law_name)
     
     def _get_general_law_detail(self, law_id: str, law_msn: str, 
-                               law_name: str) -> Optional[Dict[str, Any]]:
+                                law_name: str) -> Optional[Dict[str, Any]]:
         """일반 법령 상세 정보 (행정규칙 포함)"""
         params = {
             'OC': self.oc_code,
@@ -842,7 +844,7 @@ class LawCollectorAPI:
             return None
     
     def _parse_law_detail(self, content: str, law_id: str, 
-                         law_msn: str, law_name: str) -> Dict[str, Any]:
+                          law_msn: str, law_name: str) -> Dict[str, Any]:
         """법령 상세 정보 파싱"""
         detail = {
             'law_id': law_id,
@@ -961,7 +963,7 @@ class LawCollectorAPI:
         return articles
     
     def _extract_supplementary_provisions(self, root: ET.Element, 
-                                        detail: Dict[str, Any]) -> None:
+                                          detail: Dict[str, Any]) -> None:
         """부칙 추출"""
         for addendum in root.findall('.//부칙'):
             provision = {
@@ -1097,7 +1099,7 @@ class LawExporter:
         return zip_buffer.getvalue()
     
     def export_single_file(self, laws_dict: Dict[str, Dict[str, Any]], 
-                          format: str = 'json') -> str:
+                           format: str = 'json') -> str:
         """단일 파일로 내보내기"""
         exporters = {
             'json': self._export_as_json,
@@ -1248,8 +1250,8 @@ class LawExporter:
         
         # 통계
         admin_rule_count = sum(1 for law in laws_dict.values() 
-                             if '행정규칙' in law.get('law_type', '') or 
-                             law.get('law_type') in ['훈령', '예규', '고시', '규정'])
+                               if '행정규칙' in law.get('law_type', '') or 
+                               law.get('law_type') in ['훈령', '예규', '고시', '규정'])
         if admin_rule_count > 0:
             lines.append(f"**행정규칙 수**: {admin_rule_count}개")
         
@@ -1260,7 +1262,7 @@ class LawExporter:
         for idx, (law_id, law) in enumerate(laws_dict.items(), 1):
             anchor = self._sanitize_filename(law['law_name'])
             type_emoji = "📋" if (law.get('is_admin_rule') or 
-                                 law.get('law_type') in ['훈령', '예규', '고시', '규정']) else "📖"
+                                  law.get('law_type') in ['훈령', '예규', '고시', '규정']) else "📖"
             lines.append(f"{idx}. {type_emoji} [{law['law_name']}](#{anchor})")
         lines.append("\n---\n")
         
@@ -1278,8 +1280,8 @@ class LawExporter:
         total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in laws_dict.values())
         total_attachments = sum(len(law.get('attachments', [])) for law in laws_dict.values())
         admin_rule_count = sum(1 for law in laws_dict.values() 
-                              if '행정규칙' in law.get('law_type', '') or 
-                              law.get('law_type') in ['훈령', '예규', '고시', '규정'])
+                               if '행정규칙' in law.get('law_type', '') or 
+                               law.get('law_type') in ['훈령', '예규', '고시', '규정'])
         
         content = f"""# 법령 수집 결과
 
@@ -1337,7 +1339,7 @@ class LawExporter:
                     content += f"- 소관부처: {law.get('department', '')}\n"
                 content += f"- 시행일자: {law.get('enforcement_date', '')}\n"
                 content += f"- 조문: {len(law.get('articles', []))}개\n\n"
-            
+                
         return content
 
 
@@ -1441,7 +1443,7 @@ def show_sidebar():
                     del st.session_state[key]
             st.session_state.file_processed = False
             st.rerun()
-        
+            
         return oc_code
 
 
@@ -1472,7 +1474,7 @@ def test_admin_rule_search(oc_code: str):
             
             results.extend(found)
             time.sleep(0.5)
-        
+            
         if results:
             st.sidebar.success(f"총 {len(results)}개 법령 발견!")
         else:
@@ -1576,7 +1578,7 @@ def display_extracted_laws(oc_code: str):
     with col2:
         st.metric("총 법령", len(st.session_state.extracted_laws))
         admin_count = sum(1 for law in st.session_state.extracted_laws 
-                         if any(k in law for k in LawPatterns.ADMIN_KEYWORDS))
+                          if any(k in law for k in LawPatterns.ADMIN_KEYWORDS))
         if admin_count > 0:
             st.metric("행정규칙", admin_count)
     
@@ -1700,8 +1702,8 @@ def display_search_results_and_collect(oc_code: str):
         
         # 선택된 행정규칙 개수
         selected_admin = sum(1 for law in st.session_state.selected_laws 
-                           if law.get('is_admin_rule') or 
-                           law.get('law_type') in ['훈령', '예규', '고시', '규정'])
+                             if law.get('is_admin_rule') or 
+                             law.get('law_type') in ['훈령', '예규', '고시', '규정'])
         if selected_admin > 0:
             st.info(f"📋 선택된 행정규칙: {selected_admin}개")
         
@@ -1734,7 +1736,7 @@ def collect_selected_laws(oc_code: str):
     
     if success_count < total_count:
         failed_laws = [law['law_name'] for law in st.session_state.selected_laws 
-                      if law['law_id'] not in collected]
+                       if law['law_id'] not in collected]
         with st.expander("❌ 수집 실패한 법령"):
             for law_name in failed_laws:
                 st.write(f"- {law_name}")
@@ -1751,8 +1753,8 @@ def display_collection_stats(collected_laws: Dict[str, Dict[str, Any]]):
     total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in collected_laws.values())
     total_attachments = sum(len(law.get('attachments', [])) for law in collected_laws.values())
     admin_rule_count = sum(1 for law in collected_laws.values() 
-                          if '행정규칙' in law.get('law_type', '') or 
-                          law.get('law_type') in ['훈령', '예규', '고시', '규정'])
+                           if '행정규칙' in law.get('law_type', '') or 
+                           law.get('law_type') in ['훈령', '예규', '고시', '규정'])
     
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -1821,7 +1823,7 @@ def display_download_section():
     with st.expander("📊 수집 결과 상세"):
         for law_id, law in st.session_state.collected_laws.items():
             emoji = "📋" if ('행정규칙' in law.get('law_type', '') or 
-                           law.get('law_type') in ['훈령', '예규', '고시', '규정']) else "📖"
+                          law.get('law_type') in ['훈령', '예규', '고시', '규정']) else "📖"
             st.subheader(f"{emoji} {law['law_name']}")
             
             col1, col2, col3 = st.columns(3)
@@ -1847,7 +1849,7 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.1)")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.2)")
     st.markdown("**✨ 행정규칙(규정, 고시, 훈령 등) 완벽 지원!**")
     
     # 사이드바
