@@ -1,20 +1,59 @@
-# Streamlit 웹 프레임워크
+# 법령 수집기 프로젝트 의존성 패키지
+# Python 3.9+ 권장
+
+# 웹 프레임워크
 streamlit==1.46.0
 
-# HTTP 요청 처리
+# HTTP 요청 및 웹 스크래핑
 requests==2.32.4
 urllib3==2.5.0
+certifi==2025.6.15
+charset-normalizer==3.4.2
+
+# 데이터 처리
+pandas==2.3.0
+numpy==2.3.1
+openpyxl==3.1.5  # Excel 파일 처리
 
 # PDF 처리
-PyPDF2==3.0.1
-pdfplumber==0.11.7
+pdfplumber==0.11.7  # 주요 PDF 처리 라이브러리
+PyPDF2==3.0.1       # 백업 PDF 처리
+pdfminer.six==20250506  # pdfplumber 의존성
+pypdfium2==4.30.1  # PDF 렌더링
 
-# Excel 처리
-pandas==2.3.0
-openpyxl==3.1.5
+# XML 처리 (내장 라이브러리 사용, 별도 설치 불필요)
+# xml.etree.ElementTree - Python 내장
 
-# 날짜 처리
+# JSON 처리 (내장 라이브러리)
+# json - Python 내장
+
+# 파일 압축
+# zipfile - Python 내장
+
+# 날짜/시간 처리
 python-dateutil==2.9.0.post0
+pytz==2025.2
 
-# OpenAI API (선택사항이지만 설치 권장)
-openai==1.90.0
+# 로깅 (내장 라이브러리)
+# logging - Python 내장
+
+# 타입 힌팅
+typing-extensions==4.14.0
+
+# 동시성 처리 (내장 라이브러리)
+# concurrent.futures - Python 내장
+
+# 정규표현식 (내장 라이브러리)
+# re - Python 내장
+
+# AI 기능 (선택사항 - ChatGPT API 사용 시)
+openai==1.90.0  # OpenAI API 클라이언트
+
+# 개발/디버깅 도구 (선택사항)
+# pytest==8.3.4  # 테스트 프레임워크
+# black==24.10.0  # 코드 포맷터
+# flake8==7.1.1  # 코드 린터
+# mypy==1.13.0  # 타입 체커
+
+# 환경 관리 (로컬 개발용 - 선택사항)
+# python-dotenv==1.0.1  # .env 파일 관리
