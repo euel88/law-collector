@@ -603,18 +603,35 @@ class LawCollectorAPI:
         return session
     
     def search_laws(self, law_names: List[str], 
-                   progress_callback=None) -> List[Dict[str, Any]]:
-        """여러 법령을 병렬로 검색 - 중복 제거 추가"""
+                   progress_callback=None, 
+                   use_variations: bool = True) -> List[Dict[str, Any]]:
+        """여러 법령을 병렬로 검색 - 중복 제거 추가
+        
+        Args:
+            law_names: 검색할 법령명 리스트
+            progress_callback: 진행률 콜백 함수
+            use_variations: 법령명 변형 사용 여부 (기본값: True)
+                           - True: 띄어쓰기 등 변형하여 검색 (직접 검색 모드)
+                           - False: 정확한 법령명으로만 검색 (법령체계도 모드)
+        """
         results = []
         no_result_laws = []
         seen_law_ids = set()  # 중복 제거를 위한 set
         
         with ThreadPoolExecutor(max_workers=self.config.MAX_CONCURRENT) as executor:
             # 검색 작업 제출
-            future_to_law = {
-                executor.submit(self._search_with_variations, law_name): law_name
-                for law_name in law_names
-            }
+            if use_variations:
+                # 변형 검색 사용 (직접 검색 모드)
+                future_to_law = {
+                    executor.submit(self._search_with_variations, law_name): law_name
+                    for law_name in law_names
+                }
+            else:
+                # 정확한 검색만 사용 (법령체계도 모드)
+                future_to_law = {
+                    executor.submit(self.search_single_law, law_name): law_name
+                    for law_name in law_names
+                }
             
             # 결과 수집
             for idx, future in enumerate(as_completed(future_to_law)):
@@ -623,10 +640,16 @@ class LawCollectorAPI:
                 try:
                     result = future.result()
                     if result:
+                        # 결과가 리스트가 아닌 경우 리스트로 변환
+                        if not isinstance(result, list):
+                            result = [result] if result else []
+                        
                         # 중복 제거
                         for law in result:
                             if law['law_id'] not in seen_law_ids:
                                 seen_law_ids.add(law['law_id'])
+                                # 원래 검색어 저장
+                                law['search_query'] = law_name
                                 results.append(law)
                     else:
                         no_result_laws.append(law_name)
@@ -643,23 +666,37 @@ class LawCollectorAPI:
             with st.expander(f"❌ 검색되지 않은 법령 ({len(no_result_laws)}개)"):
                 for law in no_result_laws:
                     st.write(f"- {law}")
-                st.info("💡 Tip: 기관코드를 확인하거나, 법령명을 수정해보세요.")
+                
+                # 모드에 따른 다른 안내 메시지
+                if use_variations:
+                    st.info("💡 Tip: 기관코드를 확인하거나, 법령명을 수정해보세요.")
+                else:
+                    st.info("💡 Tip: 법령체계도의 법령명과 정확히 일치하는 법령만 검색됩니다.")
                     
         return results
     
     def _search_with_variations(self, law_name: str) -> List[Dict[str, Any]]:
-        """다양한 형식으로 법령 검색"""
+        """다양한 형식으로 법령 검색 - 개선된 버전"""
         variations = self._generate_search_variations(law_name)
+        all_results = []
+        seen_law_ids = set()
         
-        for variation in variations:
+        for idx, variation in enumerate(variations):
+            self.logger.info(f"검색 변형 {idx+1}/{len(variations)}: {variation}")
             results = self.search_single_law(variation)
+            
             if results:
-                # 원래 검색어 저장
+                # 어떤 변형으로 찾았는지 기록
                 for result in results:
-                    result['search_query'] = law_name
-                return results
+                    # 중복 제거
+                    if result['law_id'] not in seen_law_ids:
+                        seen_law_ids.add(result['law_id'])
+                        result['found_with_variation'] = variation
+                        result['variation_index'] = idx
+                        result['search_query'] = law_name  # 원래 검색어 보존
+                        all_results.append(result)
         
-        return []
+        return all_results
     
     def _generate_search_variations(self, law_name: str) -> List[str]:
         """법령명의 다양한 변형 생성"""
@@ -2199,6 +2236,10 @@ def handle_direct_search_mode(oc_code: str):
     """직접 검색 모드 처리"""
     st.header("🔍 직접 검색 모드")
     
+    # 직접 검색 모드 설명
+    with st.info("💡 직접 검색 모드에서는 띄어쓰기 변형을 포함하여 최대한 많은 법령을 찾습니다."):
+        st.caption("예: '공인노무사법시행령' → '공인노무사법 시행령'도 함께 검색")
+    
     law_name = st.text_input(
         "법령명",
         placeholder="예: 민법, 상법, 금융감독규정",
@@ -2213,7 +2254,9 @@ def handle_direct_search_mode(oc_code: str):
         else:
             with st.spinner(f"'{law_name}' 검색 중..."):
                 collector = LawCollectorAPI(oc_code)
-                results = collector.search_single_law(law_name)
+                
+                # 직접 검색은 변형 검색을 사용
+                results = collector._search_with_variations(law_name)
                 
                 if results:
                     st.success(f"{len(results)}개의 법령을 찾았습니다!")
@@ -2222,6 +2265,17 @@ def handle_direct_search_mode(oc_code: str):
                     admin_count = sum(1 for r in results if r.get('is_admin_rule'))
                     if admin_count > 0:
                         st.info(f"📋 이 중 {admin_count}개는 행정규칙입니다.")
+                    
+                    # 어떤 변형으로 찾았는지 표시
+                    variations_used = set()
+                    for r in results:
+                        if 'found_with_variation' in r:
+                            variations_used.add(r['found_with_variation'])
+                    
+                    if variations_used and len(variations_used) > 1:
+                        with st.expander("🔍 검색에 사용된 변형"):
+                            for var in variations_used:
+                                st.write(f"- {var}")
                     
                     st.session_state.search_results = results
                 else:
@@ -2332,11 +2386,20 @@ def display_extracted_laws(oc_code: str):
         if not oc_code:
             st.error("기관코드를 입력해주세요!")
         else:
-            search_laws_from_list(oc_code, edited_laws or st.session_state.extracted_laws)
+            # 파일 업로드 모드로 검색 (변형 검색 사용하지 않음)
+            search_laws_from_list(oc_code, edited_laws or st.session_state.extracted_laws, is_from_file=True)
 
 
-def search_laws_from_list(oc_code: str, law_names: List[str]):
-    """법령 목록 검색"""
+def search_laws_from_list(oc_code: str, law_names: List[str], is_from_file: bool = True):
+    """법령 목록 검색
+    
+    Args:
+        oc_code: 기관코드
+        law_names: 검색할 법령명 리스트
+        is_from_file: 파일에서 추출된 법령인지 여부 (기본값: True)
+                     - True: 법령체계도 모드 (정확한 검색)
+                     - False: 직접 입력 모드 (변형 검색)
+    """
     collector = LawCollectorAPI(oc_code)
     
     progress_bar = st.progress(0)
@@ -2345,8 +2408,19 @@ def search_laws_from_list(oc_code: str, law_names: List[str]):
     def update_progress(progress):
         progress_bar.progress(progress)
     
+    # 모드 표시
+    if is_from_file:
+        st.info("📋 법령체계도 모드: 추출된 법령명과 정확히 일치하는 법령만 검색합니다.")
+    else:
+        st.info("🔍 직접 검색 모드: 띄어쓰기 변형 등을 포함하여 포괄적으로 검색합니다.")
+    
     with st.spinner("법령을 검색하는 중..."):
-        results = collector.search_laws(law_names, progress_callback=update_progress)
+        # use_variations 파라미터를 모드에 따라 설정
+        results = collector.search_laws(
+            law_names, 
+            progress_callback=update_progress,
+            use_variations=(not is_from_file)  # 파일 모드일 때는 False
+        )
     
     progress_bar.progress(1.0)
     status_text.text("검색 완료!")
@@ -2358,6 +2432,14 @@ def search_laws_from_list(oc_code: str, law_names: List[str]):
         admin_count = sum(1 for r in results if r.get('is_admin_rule'))
         if admin_count > 0:
             st.info(f"📋 이 중 {admin_count}개는 행정규칙입니다.")
+        
+        # 법령체계도 모드에서는 추가 정보 표시
+        if is_from_file:
+            with st.expander("💡 검색 모드 정보"):
+                st.write("**법령체계도 모드**에서는 다음과 같이 작동합니다:")
+                st.write("- ✅ 추출된 법령명과 정확히 일치하는 법령만 검색")
+                st.write("- ❌ 띄어쓰기 변형이나 유사 법령명 검색하지 않음")
+                st.write("- 💡 법령체계도에 명시된 법령만 수집하여 정확성 보장")
         
         st.session_state.search_results = results
     else:
