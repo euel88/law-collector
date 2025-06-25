@@ -1,8 +1,7 @@
 """
-법제처 법령 수집기 - 버그 수정 완료 버전 (v6.6)
-- 법령명 추출 정확도 개선 (연결된 텍스트 분리)
-- 중복 수집 방지
-- PDF 다운로드 기능 수정
+법제처 법령 수집기 - 정확한 검색 모드 수정 버전 (v6.7)
+- 파일 업로드 모드: 법령체계도의 정확한 법령명만 검색
+- 직접 검색 모드: 변형 검색 유지
 """
 
 import streamlit as st
@@ -561,7 +560,7 @@ class EnhancedLawFileExtractor:
 
 # ===== 법령 수집 API 클래스 =====
 class LawCollectorAPI:
-    """개선된 법령 수집 API 클래스 - 행정규칙 완벽 지원"""
+    """개선된 법령 수집 API 클래스 - 정확한 검색 모드 추가"""
     
     def __init__(self, oc_code: str):
         self.oc_code = oc_code
@@ -629,7 +628,7 @@ class LawCollectorAPI:
             else:
                 # 정확한 검색만 사용 (법령체계도 모드)
                 future_to_law = {
-                    executor.submit(self.search_single_law, law_name): law_name
+                    executor.submit(self._search_exact_match, law_name): law_name
                     for law_name in law_names
                 }
             
@@ -674,6 +673,48 @@ class LawCollectorAPI:
                     st.info("💡 Tip: 법령체계도의 법령명과 정확히 일치하는 법령만 검색됩니다.")
                     
         return results
+    
+    def _search_exact_match(self, law_name: str) -> List[Dict[str, Any]]:
+        """정확한 매칭으로만 법령 검색 - 파일 업로드 모드용"""
+        self.logger.info(f"정확한 검색 모드: {law_name}")
+        
+        # 변형 없이 원본 그대로만 검색
+        results = self._search_single_law_exact(law_name)
+        
+        # 검색 결과 필터링 - 정확히 일치하는 것만
+        filtered_results = []
+        for result in results:
+            # 법령명이 정확히 일치하는지 확인
+            if result['law_name'] == law_name:
+                filtered_results.append(result)
+                self.logger.debug(f"정확히 일치: {result['law_name']}")
+            else:
+                self.logger.debug(f"일치하지 않음: {result['law_name']} != {law_name}")
+        
+        return filtered_results
+    
+    def _search_single_law_exact(self, law_name: str) -> List[Dict[str, Any]]:
+        """단일 법령 정확한 검색 - 일반 법령과 행정규칙 모두"""
+        results = []
+        
+        # 1. 일반 법령 검색 (target=law)
+        general_laws = self._search_general_law(law_name)
+        results.extend(general_laws)
+        
+        # 2. 행정규칙 검색 (별도 API)
+        admin_rules = self._search_admin_rule(law_name)
+        results.extend(admin_rules)
+        
+        # 중복 제거
+        unique_results = self._remove_duplicates(results)
+        
+        # 검색 결과 로그
+        if unique_results:
+            general_count = sum(1 for r in unique_results if not r.get('is_admin_rule'))
+            admin_count = sum(1 for r in unique_results if r.get('is_admin_rule'))
+            self.logger.info(f"✅ 정확한 검색 완료: {law_name} - 일반법령 {general_count}개, 행정규칙 {admin_count}개")
+        
+        return unique_results
     
     def _search_with_variations(self, law_name: str) -> List[Dict[str, Any]]:
         """다양한 형식으로 법령 검색 - 개선된 버전"""
@@ -2756,8 +2797,8 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.6)")
-    st.markdown("**✨ 버그 수정 완료: 법령명 분리, 중복 제거, PDF 다운로드 개선!**")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.7)")
+    st.markdown("**✨ 파일 업로드 시 정확한 법령명만 검색하도록 수정!**")
     
     # 사이드바
     oc_code = show_sidebar()
