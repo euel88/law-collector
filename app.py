@@ -368,7 +368,7 @@ class EnhancedLawFileExtractor:
         return processed
     
     def _enhance_with_ai(self, text: str, laws: Set[str]) -> Set[str]:
-        """AI를 활용한 법령명 추출 개선 - 수정된 버전"""
+        """AI를 활용한 법령명 추출 개선 - 강화된 버전"""
         try:
             # OpenAI 라이브러리 체크
             try:
@@ -404,23 +404,23 @@ class EnhancedLawFileExtractor:
                 # 텍스트 샘플링 (토큰 제한)
                 sample = text[:3000]
                 
-                # 프롬프트 구성
-                prompt = self._create_ai_prompt(sample, laws)
+                # 프롬프트 구성 - 강화된 버전
+                prompt = self._create_enhanced_ai_prompt(sample, laws, text)
                 
                 # API 호출 - 안전한 방식으로
                 try:
                     response = client.chat.completions.create(
                         model="gpt-3.5-turbo",
                         messages=[
-                            {"role": "system", "content": "한국 법령 데이터베이스 전문가"},
+                            {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                             {"role": "user", "content": prompt}
                         ],
                         temperature=0.1,
-                        max_tokens=1000
+                        max_tokens=1500
                     )
                     
                     # 응답 파싱
-                    ai_laws = self._parse_ai_response(response.choices[0].message.content)
+                    ai_laws = self._parse_ai_response_enhanced(response.choices[0].message.content)
                     
                     self.logger.info(f"AI가 추가로 {len(ai_laws - laws)}개의 법령을 찾았습니다.")
                     
@@ -433,14 +433,14 @@ class EnhancedLawFileExtractor:
                         response = client.chat.completions.create(
                             model="gpt-4",
                             messages=[
-                                {"role": "system", "content": "한국 법령 데이터베이스 전문가"},
+                                {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                                 {"role": "user", "content": prompt}
                             ],
                             temperature=0.1,
-                            max_tokens=1000
+                            max_tokens=1500
                         )
                         
-                        ai_laws = self._parse_ai_response(response.choices[0].message.content)
+                        ai_laws = self._parse_ai_response_enhanced(response.choices[0].message.content)
                         self.logger.info(f"GPT-4로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
                         return laws.union(ai_laws)
                         
@@ -464,27 +464,66 @@ class EnhancedLawFileExtractor:
             self.logger.error(f"AI 처리 오류: {e}")
             return laws
     
-    def _create_ai_prompt(self, text: str, existing_laws: Set[str]) -> str:
-        """AI 프롬프트 생성"""
-        return f"""다음 텍스트에서 한국 법령명을 정확히 추출하세요.
+    def _create_enhanced_ai_prompt(self, sample: str, existing_laws: Set[str], full_text: str) -> str:
+        """강화된 AI 프롬프트 생성"""
+        # 문서 구조 분석
+        doc_structure = self._analyze_document_structure(full_text)
+        
+        return f"""당신은 한국 법령 전문가입니다. 다음 법령체계도 문서에서 법령명을 정확히 추출하세요.
 
-규칙:
+중요 규칙:
 1. 법제처 공식 명칭 사용
-2. "상하위법", "관련법령", "행정규칙", "법령" 같은 카테고리나 접두어 제외
-3. 날짜(예: 20250422) 제외
-4. 시행령/시행규칙은 기본법과 함께 표기
-5. 한 줄에 하나씩 출력
+2. 특수문자 변환: * → ·, ＊ → ·
+3. "상하위법", "관련법령", "행정규칙", "법령" 같은 카테고리 제목은 제외
+4. 날짜(예: 20250422, [시행 2022.12.11.]) 제외
+5. 시행령/시행규칙은 독립된 법령으로 추출
+6. 문서에 있는 모든 법령명을 빠짐없이 추출
 
-텍스트:
-{text}
+문서 구조 정보:
+{doc_structure}
 
-현재 추출된 법령 (참고):
+텍스트 샘플:
+{sample}
+
+현재까지 추출된 법령 (참고):
 {', '.join(list(existing_laws)[:10])}
 
-법령명만 출력:"""
+다음과 같은 법령들을 특히 주의해서 찾으세요:
+- 행정규칙 (규정, 훈령, 예규, 지침, 세칙 등)
+- 특수문자가 포함된 법령명 (예: 심의·징계위원회)
+- 긴 법령명 (예: 근로기준법 및 공인노무사법에 따른 과태료의 가중처분에 관한 세부 지침)
+
+법령명만 한 줄에 하나씩 출력하세요:"""
     
-    def _parse_ai_response(self, response: str) -> Set[str]:
-        """AI 응답 파싱"""
+    def _analyze_document_structure(self, text: str) -> str:
+        """문서 구조 분석"""
+        lines = text.split('\n')
+        structure_info = []
+        
+        # 카테고리 키워드
+        category_keywords = ['상하위법', '관련법령', '행정규칙', '법령']
+        
+        current_category = None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # 카테고리 감지
+            for keyword in category_keywords:
+                if keyword in line and len(line) < 20:  # 짧은 라인에서만
+                    current_category = keyword
+                    structure_info.append(f"[{keyword} 섹션 시작]")
+                    break
+            
+            # 날짜 패턴 감지
+            if re.search(r'\[시행\s*\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.\]', line):
+                structure_info.append(f"날짜가 포함된 법령 발견: {line[:50]}...")
+        
+        return '\n'.join(structure_info[:10])  # 최대 10개까지만
+    
+    def _parse_ai_response_enhanced(self, response: str) -> Set[str]:
+        """강화된 AI 응답 파싱"""
         laws = set()
         
         for line in response.strip().split('\n'):
@@ -498,10 +537,37 @@ class EnhancedLawFileExtractor:
             for prefix_pattern in self.patterns.PREFIX_PATTERNS:
                 line = re.sub(prefix_pattern, '', line)
             
+            # 특수문자 정규화
+            line = self._normalize_law_name_for_ai(line)
+            
             if line and self._validate_law_name(line):
                 laws.add(line)
+                self.logger.debug(f"AI 추출: {line}")
                 
         return laws
+    
+    def _normalize_law_name_for_ai(self, law_name: str) -> str:
+        """AI 응답에서 법령명 정규화"""
+        # 특수문자 변환
+        replacements = {
+            '*': '·',
+            '＊': '·',
+            '․': '·',
+            '･': '·',
+            '・': '·',
+            '，': ',',
+            '．': '.',
+            '（': '(',
+            '）': ')',
+        }
+        
+        for old, new in replacements.items():
+            law_name = law_name.replace(old, new)
+        
+        # 연속 공백 제거
+        law_name = ' '.join(law_name.split())
+        
+        return law_name.strip()
     
     def _extract_from_excel(self, file) -> List[str]:
         """Excel 파일에서 법령명 추출"""
@@ -675,23 +741,110 @@ class LawCollectorAPI:
         return results
     
     def _search_exact_match(self, law_name: str) -> List[Dict[str, Any]]:
-        """정확한 매칭으로만 법령 검색 - 파일 업로드 모드용"""
-        self.logger.info(f"정확한 검색 모드: {law_name}")
+        """개선된 매칭으로 법령 검색 - 파일 업로드 모드용"""
+        self.logger.info(f"파일 업로드 검색 모드: {law_name}")
         
-        # 변형 없이 원본 그대로만 검색
+        # 특수문자 정규화
+        normalized_name = self._normalize_law_name(law_name)
+        
+        # 기본 검색 + 정규화된 이름으로도 검색
+        all_results = []
+        
+        # 1. 원본 그대로 검색
         results = self._search_single_law_exact(law_name)
+        all_results.extend(results)
         
-        # 검색 결과 필터링 - 정확히 일치하는 것만
+        # 2. 정규화된 이름으로 검색 (다른 경우만)
+        if normalized_name != law_name:
+            normalized_results = self._search_single_law_exact(normalized_name)
+            all_results.extend(normalized_results)
+        
+        # 중복 제거
+        seen_ids = set()
+        unique_results = []
+        
+        for result in all_results:
+            if result['law_id'] not in seen_ids:
+                seen_ids.add(result['law_id'])
+                unique_results.append(result)
+        
+        # 결과 필터링 - 유사도 기반
         filtered_results = []
-        for result in results:
-            # 법령명이 정확히 일치하는지 확인
-            if result['law_name'] == law_name:
+        for result in unique_results:
+            similarity = self._calculate_similarity(law_name, result['law_name'])
+            if similarity >= 0.85:  # 85% 이상 유사도
                 filtered_results.append(result)
-                self.logger.debug(f"정확히 일치: {result['law_name']}")
+                self.logger.debug(f"매칭 성공 (유사도 {similarity:.2f}): {result['law_name']}")
             else:
-                self.logger.debug(f"일치하지 않음: {result['law_name']} != {law_name}")
+                self.logger.debug(f"매칭 실패 (유사도 {similarity:.2f}): {result['law_name']} != {law_name}")
         
         return filtered_results
+    
+    def _normalize_law_name(self, law_name: str) -> str:
+        """법령명 정규화 - 특수문자 처리"""
+        normalized = law_name
+        
+        # 특수문자 변환
+        replacements = {
+            '*': '·',
+            '＊': '·',
+            '․': '·',
+            '･': '·',
+            '・': '·',
+            '，': ',',
+            '．': '.',
+            '（': '(',
+            '）': ')',
+            '「': '',
+            '」': '',
+            '『': '',
+            '』': '',
+        }
+        
+        for old, new in replacements.items():
+            normalized = normalized.replace(old, new)
+        
+        # 연속 공백 제거
+        normalized = ' '.join(normalized.split())
+        
+        return normalized.strip()
+    
+    def _calculate_similarity(self, str1: str, str2: str) -> float:
+        """두 문자열의 유사도 계산 (0~1)"""
+        # 간단한 문자 기반 유사도
+        str1 = self._normalize_law_name(str1.lower())
+        str2 = self._normalize_law_name(str2.lower())
+        
+        if str1 == str2:
+            return 1.0
+        
+        # 레벤슈타인 거리 기반 유사도
+        longer = max(len(str1), len(str2))
+        if longer == 0:
+            return 1.0
+        
+        distance = self._levenshtein_distance(str1, str2)
+        return (longer - distance) / longer
+    
+    def _levenshtein_distance(self, s1: str, s2: str) -> int:
+        """레벤슈타인 거리 계산"""
+        if len(s1) < len(s2):
+            return self._levenshtein_distance(s2, s1)
+        
+        if len(s2) == 0:
+            return len(s1)
+        
+        previous_row = range(len(s2) + 1)
+        for i, c1 in enumerate(s1):
+            current_row = [i + 1]
+            for j, c2 in enumerate(s2):
+                insertions = previous_row[j + 1] + 1
+                deletions = current_row[j] + 1
+                substitutions = previous_row[j] + (c1 != c2)
+                current_row.append(min(insertions, deletions, substitutions))
+            previous_row = current_row
+        
+        return previous_row[-1]
     
     def _search_single_law_exact(self, law_name: str) -> List[Dict[str, Any]]:
         """단일 법령 정확한 검색 - 일반 법령과 행정규칙 모두"""
@@ -2797,8 +2950,8 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.7)")
-    st.markdown("**✨ 파일 업로드 시 정확한 법령명만 검색하도록 수정!**")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.8)")
+    st.markdown("**✨ 파일 업로드 검색 개선: 유사도 기반 매칭 + AI 의도 파악 강화!**")
     
     # 사이드바
     oc_code = show_sidebar()
