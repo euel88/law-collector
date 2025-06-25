@@ -1,8 +1,8 @@
 """
-법제처 법령 수집기 - 버그 수정 버전 (v6.5)
-- OpenAI API 키 인식 문제 해결
-- 파일 다운로드 형식 지원 확대
-- 별표/별첨 PDF 다운로드 기능 개선
+법제처 법령 수집기 - 버그 수정 완료 버전 (v6.6)
+- 법령명 추출 정확도 개선 (연결된 텍스트 분리)
+- 중복 수집 방지
+- PDF 다운로드 기능 수정
 """
 
 import streamlit as st
@@ -65,11 +65,11 @@ class APIConfig:
 
 
 class LawPatterns:
-    """법령명 추출 패턴을 관리하는 클래스"""
+    """법령명 추출 패턴을 관리하는 클래스 - 개선된 버전"""
     
     # 제외 키워드 (수정: 키워드만 남김)
     EXCLUDE_KEYWORDS = {
-        '상하위법', '관련법령', '상위법', '하위법'
+        '상하위법', '관련법령', '상위법', '하위법', '선택된'
     }
     
     # 법령 타입
@@ -88,9 +88,10 @@ class LawPatterns:
         r'^행정규칙\s*',
         r'^법령\s*',
         r'^\d{8}\s*',  # 날짜 형식 (20250422 같은)
+        r'^\d+\.\s*',  # 번호 형식 (1. 2. 같은)
     ]
     
-    # 법령명 패턴 (정규표현식)
+    # 법령명 패턴 (정규표현식) - 개선된 버전
     LAW_PATTERNS = [
         # 시행 날짜 포함 패턴
         r'([가-힣]+(?:\s+[가-힣]+)*(?:법|법률|규정|규칙|세칙|분류))\s*\[시행\s*\d{4}\.\s*\d{1,2}\.\s*\d{1,2}\.\]',
@@ -105,6 +106,10 @@ class LawPatterns:
         # 시행령/시행규칙
         r'^([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s+시행령(?:\s|$)',
         r'^([가-힣]+(?:\s+[가-힣]+)*법(?:률)?)\s+시행규칙(?:\s|$)',
+        # 고시/훈령 패턴 추가
+        r'([가-힣]+(?:\s+[가-힣]+)*(?:고시|훈령|예규|지침))(?:\s|$)',
+        # 분류 패턴 추가
+        r'([가-힣]+(?:\s+)?분류)(?:\s|$)',
     ]
 
 
@@ -177,11 +182,16 @@ class EnhancedLawFileExtractor:
             raise
     
     def _extract_laws_from_text(self, text: str) -> Set[str]:
-        """텍스트에서 법령명 추출"""
+        """텍스트에서 법령명 추출 - 개선된 버전"""
         laws = set()
         
         # 텍스트 정규화
         text = self._normalize_text(text)
+        
+        # 제외 키워드로 텍스트 분할 처리
+        # '여신전문금융업법 상하위법 여신전문금융업법' -> 분리
+        for exclude_keyword in self.patterns.EXCLUDE_KEYWORDS:
+            text = text.replace(exclude_keyword, '\n')
         
         # 패턴 매칭으로 법령명 추출
         for pattern in self.patterns.LAW_PATTERNS:
@@ -195,6 +205,27 @@ class EnhancedLawFileExtractor:
         for line in text.split('\n'):
             line = line.strip()
             
+            # 제외 키워드가 포함된 라인은 분할 처리
+            contains_exclude = False
+            for exclude_keyword in self.patterns.EXCLUDE_KEYWORDS:
+                if exclude_keyword in line:
+                    # 제외 키워드 앞뒤로 분할
+                    parts = line.split(exclude_keyword)
+                    for part in parts:
+                        part = part.strip()
+                        if part and part not in self.patterns.EXCLUDE_KEYWORDS:
+                            # 각 부분에서 법령명 추출
+                            for law_type in self.patterns.LAW_TYPES:
+                                if law_type in part:
+                                    law_name = self._extract_law_name_from_line(part, law_type)
+                                    if law_name and self._validate_law_name(law_name):
+                                        laws.add(law_name)
+                    contains_exclude = True
+                    break
+            
+            if contains_exclude:
+                continue
+                
             # 접두어 제거
             for prefix_pattern in self.patterns.PREFIX_PATTERNS:
                 line = re.sub(prefix_pattern, '', line)
@@ -538,6 +569,7 @@ class LawCollectorAPI:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.session = self._create_session()
         self._cache = {}  # 검색 결과 캐시
+        self._pdf_cache = {}  # PDF URL 캐시 추가
         
     @lru_cache(maxsize=128)
     def _get_cached_search_result(self, law_name: str) -> Optional[str]:
@@ -572,9 +604,10 @@ class LawCollectorAPI:
     
     def search_laws(self, law_names: List[str], 
                    progress_callback=None) -> List[Dict[str, Any]]:
-        """여러 법령을 병렬로 검색"""
+        """여러 법령을 병렬로 검색 - 중복 제거 추가"""
         results = []
         no_result_laws = []
+        seen_law_ids = set()  # 중복 제거를 위한 set
         
         with ThreadPoolExecutor(max_workers=self.config.MAX_CONCURRENT) as executor:
             # 검색 작업 제출
@@ -590,7 +623,11 @@ class LawCollectorAPI:
                 try:
                     result = future.result()
                     if result:
-                        results.extend(result)
+                        # 중복 제거
+                        for law in result:
+                            if law['law_id'] not in seen_law_ids:
+                                seen_law_ids.add(law['law_id'])
+                                results.append(law)
                     else:
                         no_result_laws.append(law_name)
                     
@@ -1171,7 +1208,7 @@ class LawCollectorAPI:
                 detail['attachments'].append(attachment)
     
     def _extract_pdf_attachments_enhanced(self, root: ET.Element, detail: Dict[str, Any]) -> None:
-        """PDF 첨부파일 추출 - 개선된 버전"""
+        """PDF 첨부파일 추출 - 수정된 버전"""
         # 별표/별지 정보에서 PDF URL 패턴 추출
         law_name = detail['law_name']
         law_msn = detail['law_msn']
@@ -1181,73 +1218,188 @@ class LawCollectorAPI:
         # 법령명에서 괄호 제거 (URL에서 문제 일으킬 수 있음)
         clean_law_name = re.sub(r'\([^)]*\)', '', law_name).strip()
         
-        # 1. XML에서 직접 파일 정보 추출
-        pdf_found = False
-        for elem in root.iter():
-            # 파일 관련 태그들 확인
-            if elem.tag in ['첨부파일', '파일', 'file', 'attachment']:
-                file_seq = elem.findtext('파일순번', '') or elem.findtext('순번', '')
-                file_name = elem.findtext('파일명', '') or elem.findtext('명칭', '')
-                file_type = elem.findtext('파일유형', '')
-                
-                if file_name and (file_name.lower().endswith('.pdf') or file_type == 'PDF'):
+        # 1. XML에서 직접 첨부파일 정보 추출 - 다양한 태그 확인
+        pdf_tags = ['첨부파일', '파일', 'file', 'attachment', '별표파일', '별지파일', 
+                    '별표서식', '별지서식', '첨부', '부속서류']
+        
+        for tag in pdf_tags:
+            for elem in root.findall(f'.//{tag}'):
+                # 파일 정보 추출
+                file_info = self._extract_file_info_from_element(elem)
+                if file_info and (file_info.get('is_pdf') or '별표' in file_info.get('name', '') or '별지' in file_info.get('name', '')):
                     pdf_info = {
-                        'file_seq': file_seq,
-                        'file_name': file_name,
-                        'type': self._determine_attachment_type(file_name),
-                        'url': self._build_pdf_url(law_msn, file_seq) if file_seq else '',
+                        'file_seq': file_info.get('seq', ''),
+                        'file_name': file_info.get('name', ''),
+                        'type': file_info.get('type', '첨부파일'),
+                        'url': file_info.get('url', ''),
                         'direct_url': False
                     }
-                    detail['attachment_pdfs'].append(pdf_info)
-                    pdf_found = True
-                    self.logger.debug(f"XML에서 PDF 발견: {file_name}")
+                    
+                    # URL이 없으면 생성
+                    if not pdf_info['url'] and file_info.get('seq'):
+                        pdf_info['url'] = self._build_pdf_url(law_msn, file_info['seq'])
+                    
+                    if pdf_info['url'] or pdf_info['file_name']:
+                        detail['attachment_pdfs'].append(pdf_info)
+                        self.logger.debug(f"XML에서 PDF 발견: {pdf_info['file_name']}")
         
-        # 2. 별표/별지 정보 기반 URL 생성
-        if detail['attachments']:
+        # 2. 별표/별지 내용에서 파일 정보 추출
+        for attachment in detail.get('attachments', []):
+            # 별표/별지 내용에 파일 정보가 있는지 확인
+            content = attachment.get('content', '')
+            if '파일' in content or '.pdf' in content.lower() or 'PDF' in content:
+                att_type = attachment['type']
+                att_num = attachment['number']
+                
+                if att_type and att_num:
+                    # PDF 정보 생성
+                    pdf_info = {
+                        'file_seq': '',
+                        'file_name': f"{clean_law_name}_{att_type}{att_num}.pdf",
+                        'type': att_type,
+                        'url': '',
+                        'direct_url': True
+                    }
+                    
+                    # URL 생성
+                    pdf_urls = self._build_attachment_pdf_urls(clean_law_name, att_type, att_num, 
+                                                             promulgation_date, enforcement_date, law_msn)
+                    if pdf_urls:
+                        pdf_info['url'] = pdf_urls[0]
+                        pdf_info['alternative_urls'] = pdf_urls[1:]
+                    
+                    # 중복 체크
+                    if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
+                        detail['attachment_pdfs'].append(pdf_info)
+                        self.logger.debug(f"별표/별지에서 PDF 추정: {pdf_info['file_name']}")
+        
+        # 3. 별표/별지가 있지만 PDF 정보가 없는 경우, 기본 URL 생성
+        if detail['attachments'] and not detail['attachment_pdfs']:
             for attachment in detail['attachments']:
                 att_type = attachment['type']
                 att_num = attachment['number']
                 
-                if att_type in ['별표', '별지', '별첨', '서식'] and att_num:
-                    # 여러 날짜 형식 시도
-                    dates_to_try = []
-                    if promulgation_date:
-                        dates_to_try.append(promulgation_date)
-                    if enforcement_date and enforcement_date != promulgation_date:
-                        dates_to_try.append(enforcement_date)
+                if att_type and att_num:
+                    pdf_info = {
+                        'file_seq': '',
+                        'file_name': f"{clean_law_name}_{att_type}{att_num}.pdf",
+                        'type': att_type,
+                        'url': '',
+                        'direct_url': True
+                    }
                     
-                    # 날짜가 없으면 최근 날짜 사용
-                    if not dates_to_try:
-                        dates_to_try.append(datetime.now().strftime('%Y%m%d'))
-                    
-                    for date_str in dates_to_try:
-                        pdf_urls = self._build_alternative_pdf_urls(
-                            clean_law_name, 
-                            att_type, 
-                            att_num, 
-                            date_str
-                        )
-                        
-                        pdf_info = {
-                            'file_seq': '',
-                            'file_name': f"{clean_law_name}_{att_type}{att_num}.pdf",
-                            'type': att_type,
-                            'url': pdf_urls[0],
-                            'alternative_urls': pdf_urls[1:],
-                            'direct_url': True,
-                            'date_used': date_str
-                        }
-                        
-                        # 중복 체크 (파일명 기준)
-                        if not any(p['file_name'] == pdf_info['file_name'] for p in detail['attachment_pdfs']):
-                            detail['attachment_pdfs'].append(pdf_info)
-                            self.logger.debug(f"{att_type} PDF URL 생성: {pdf_urls[0]}")
+                    # 다양한 날짜로 시도
+                    pdf_urls = self._build_attachment_pdf_urls(clean_law_name, att_type, att_num,
+                                                             promulgation_date, enforcement_date, law_msn)
+                    if pdf_urls:
+                        pdf_info['url'] = pdf_urls[0]
+                        pdf_info['alternative_urls'] = pdf_urls[1:]
+                        detail['attachment_pdfs'].append(pdf_info)
         
-        # 3. 로그 출력
+        # 로그 출력
         if detail['attachment_pdfs']:
             self.logger.info(f"PDF 첨부파일 {len(detail['attachment_pdfs'])}개 발견: {law_name}")
+        elif detail['attachments']:
+            self.logger.warning(f"별표/별지는 있지만 PDF 정보 없음: {law_name}")
+    
+    def _extract_file_info_from_element(self, elem: ET.Element) -> Dict[str, Any]:
+        """XML 요소에서 파일 정보 추출"""
+        file_info = {}
+        
+        # 다양한 속성명 확인
+        seq_names = ['파일순번', '순번', 'seq', 'fileSeq', 'file_seq', '일련번호']
+        name_names = ['파일명', '명칭', 'name', 'fileName', 'file_name', '파일이름']
+        type_names = ['파일유형', '유형', 'type', 'fileType', 'file_type', '종류']
+        url_names = ['url', 'URL', '주소', 'link', '링크', '다운로드주소']
+        
+        # 속성 추출
+        for seq_name in seq_names:
+            if elem.findtext(seq_name):
+                file_info['seq'] = elem.findtext(seq_name)
+                break
+        
+        for name_name in name_names:
+            if elem.findtext(name_name):
+                file_info['name'] = elem.findtext(name_name)
+                break
+        
+        for type_name in type_names:
+            if elem.findtext(type_name):
+                file_info['type'] = elem.findtext(type_name)
+                break
+        
+        for url_name in url_names:
+            if elem.findtext(url_name):
+                file_info['url'] = elem.findtext(url_name)
+                break
+        
+        # PDF 여부 확인
+        if file_info.get('name', '').lower().endswith('.pdf'):
+            file_info['is_pdf'] = True
+        elif file_info.get('type', '').upper() == 'PDF':
+            file_info['is_pdf'] = True
         else:
-            self.logger.debug(f"PDF 첨부파일 없음: {law_name}")
+            file_info['is_pdf'] = False
+        
+        # 별표/별지 유형 추출
+        if file_info.get('name'):
+            if '별표' in file_info['name']:
+                file_info['type'] = '별표'
+            elif '별지' in file_info['name']:
+                file_info['type'] = '별지'
+            elif '별첨' in file_info['name']:
+                file_info['type'] = '별첨'
+            elif '서식' in file_info['name']:
+                file_info['type'] = '서식'
+        
+        return file_info if (file_info.get('seq') or file_info.get('name')) else {}
+    
+    def _build_attachment_pdf_urls(self, law_name: str, attachment_type: str, 
+                                   attachment_number: str, promulgation_date: str,
+                                   enforcement_date: str, law_msn: str) -> List[str]:
+        """다양한 PDF URL 패턴 생성 - 개선된 버전"""
+        urls = []
+        
+        # URL 안전 문자로 변환
+        import urllib.parse
+        
+        # 날짜 형식 통일 (YYYYMMDD)
+        dates_to_try = []
+        if promulgation_date:
+            dates_to_try.append(promulgation_date.replace('-', '').replace('.', ''))
+        if enforcement_date and enforcement_date != promulgation_date:
+            dates_to_try.append(enforcement_date.replace('-', '').replace('.', ''))
+        
+        # 날짜가 없으면 최근 날짜 사용
+        if not dates_to_try:
+            dates_to_try.append(datetime.now().strftime('%Y%m%d'))
+        
+        for date_str in dates_to_try:
+            # 1. 법제처 표준 패턴 (가장 일반적)
+            base_pattern = f"https://www.law.go.kr/법령별표서식/({law_name},{date_str},{attachment_type}{attachment_number})"
+            urls.append(base_pattern)
+            
+            # 2. URL 인코딩된 버전
+            encoded_pattern = f"https://www.law.go.kr/법령별표서식/({urllib.parse.quote(law_name)},{date_str},{urllib.parse.quote(attachment_type)}{attachment_number})"
+            urls.append(encoded_pattern)
+            
+            # 3. 공백 제거 버전
+            no_space_law = law_name.replace(' ', '')
+            no_space_pattern = f"https://www.law.go.kr/법령별표서식/({no_space_law},{date_str},{attachment_type}{attachment_number})"
+            urls.append(no_space_pattern)
+        
+        # 4. 법제처 다운로드 API 패턴 (파일 시퀀스 기반)
+        if law_msn:
+            download_api = f"https://www.law.go.kr/flDownload.do?type=ATTACHED_FILE&lawSeq={law_msn}&flNm={urllib.parse.quote(law_name)}_{attachment_type}{attachment_number}.pdf"
+            urls.append(download_api)
+        
+        # 5. 직접 파일 접근 패턴
+        if dates_to_try:
+            year = dates_to_try[0][:4]
+            direct_file = f"https://www.law.go.kr/files/{attachment_type}/{year}/{urllib.parse.quote(law_name)}_{attachment_type}{attachment_number}.pdf"
+            urls.append(direct_file)
+        
+        return urls
     
     def _determine_attachment_type(self, filename: str) -> str:
         """파일명에서 첨부파일 유형 추출"""
@@ -1262,70 +1414,10 @@ class LawCollectorAPI:
         else:
             return '첨부파일'
     
-    def _build_alternative_pdf_urls(self, law_name: str, attachment_type: str, 
-                                    attachment_number: str, date_str: str) -> List[str]:
-        """다양한 PDF URL 패턴 생성 - 실제 법제처 패턴 반영"""
-        urls = []
-        
-        # URL 안전 문자로 변환
-        import urllib.parse
-        
-        # 1. 법제처 표준 패턴 (가장 일반적)
-        # 예: https://www.law.go.kr/법령별표서식/(여신전문금융업법,20240422,별표1)
-        base_pattern = f"https://www.law.go.kr/법령별표서식/({law_name},{date_str},{attachment_type}{attachment_number})"
-        urls.append(base_pattern)
-        
-        # 2. URL 인코딩된 버전
-        encoded_pattern = f"https://www.law.go.kr/법령별표서식/({urllib.parse.quote(law_name)},{date_str},{urllib.parse.quote(attachment_type)}{attachment_number})"
-        urls.append(encoded_pattern)
-        
-        # 3. 공백 제거 버전
-        no_space_law = law_name.replace(' ', '')
-        no_space_pattern = f"https://www.law.go.kr/법령별표서식/({no_space_law},{date_str},{attachment_type}{attachment_number})"
-        urls.append(no_space_pattern)
-        
-        # 4. 법제처 다운로드 API 패턴
-        download_api = f"https://www.law.go.kr/flDownload.do?type={attachment_type}&flSeq={date_str}_{urllib.parse.quote(law_name)}_{attachment_number}"
-        urls.append(download_api)
-        
-        # 5. 직접 파일 접근 패턴 (구버전)
-        direct_file = f"https://www.law.go.kr/files/{attachment_type}/{date_str[:4]}/{urllib.parse.quote(law_name)}_{attachment_type}{attachment_number}.pdf"
-        urls.append(direct_file)
-        
-        return urls
-    
     def _build_pdf_url(self, law_msn: str, file_seq: str) -> str:
         """PDF 다운로드 URL 생성 (기본 API용)"""
         # 법제처 PDF 다운로드 URL 패턴
         return f"{self.config.PDF_DOWNLOAD_URL}?flSeq={file_seq}&flNm=&type=ATTACHED_FILE&lawSeq={law_msn}"
-    
-    def _build_alternative_pdf_urls(self, law_name: str, attachment_type: str, 
-                                    attachment_number: str, promulgation_date: str) -> List[str]:
-        """다양한 PDF URL 패턴 생성"""
-        urls = []
-        
-        # 날짜 형식 변환 (YYYY-MM-DD -> YYYYMMDD)
-        date_compact = promulgation_date.replace('-', '')
-        
-        # 1. 기본 패턴: /법령별표서식/(법령명,날짜,별표번호)
-        base_url = f"https://www.law.go.kr/법령별표서식/({law_name},{date_compact},{attachment_type}{attachment_number})"
-        urls.append(base_url)
-        
-        # 2. URL 인코딩된 패턴
-        import urllib.parse
-        encoded_law_name = urllib.parse.quote(law_name)
-        encoded_url = f"https://www.law.go.kr/법령별표서식/({encoded_law_name},{date_compact},{attachment_type}{attachment_number})"
-        urls.append(encoded_url)
-        
-        # 3. 대체 패턴: 첨부파일 다운로드 API
-        alt_url = f"https://www.law.go.kr/flDownload.do?type=FLAW&name={encoded_law_name}_{attachment_type}{attachment_number}.pdf"
-        urls.append(alt_url)
-        
-        # 4. 직접 파일 접근 패턴
-        direct_url = f"https://www.law.go.kr/files/law/{date_compact}/{encoded_law_name}_{attachment_type}{attachment_number}.pdf"
-        urls.append(direct_url)
-        
-        return urls
     
     def download_pdf_attachments(self, law_detail: Dict[str, Any]) -> List[Dict[str, Any]]:
         """PDF 첨부파일 다운로드 - 완전 개선 버전"""
@@ -2582,8 +2674,8 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.5)")
-    st.markdown("**✨ 행정규칙 완벽 지원 + PDF 첨부파일 다운로드!**")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.6)")
+    st.markdown("**✨ 버그 수정 완료: 법령명 분리, 중복 제거, PDF 다운로드 개선!**")
     
     # 사이드바
     oc_code = show_sidebar()
