@@ -18,7 +18,7 @@ import zipfile
 import pandas as pd
 import PyPDF2
 import pdfplumber
-from typing import List, Set, Dict, Optional, Tuple, Any
+from typing import List, Set, Dict, Optional, Tuple, Any, cast
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
@@ -1516,11 +1516,11 @@ class LawExporter:
     def __init__(self):
         self.logger = logging.getLogger(self.__class__.__name__)
     
-    def export_to_zip(self, laws_dict: Dict[str, Dict[str, Any]], 
+    def export_to_zip(self, laws_dict: Dict[str, Dict[str, Any]],
                      include_pdfs: bool = False) -> bytes:
         """ZIP 파일로 내보내기 - OCR 텍스트 포함"""
         zip_buffer = BytesIO()
-        
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             # 메타데이터
             metadata = {
@@ -1563,6 +1563,26 @@ class LawExporter:
             readme = self._create_readme(laws_dict, include_pdfs)
             zip_file.writestr('README.md', readme)
         
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    def export_markdown_by_file(self,
+                                grouped_laws: Dict[str, Dict[str, Dict[str, Any]]],
+                                file_metadata: Dict[str, Dict[str, Any]]) -> bytes:
+        """파일별로 통합된 Markdown 번들을 ZIP으로 반환"""
+        zip_buffer = BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_key, laws in grouped_laws.items():
+                if not laws:
+                    continue
+
+                meta = file_metadata.get(file_key, {})
+                file_name = meta.get('file_name') or ("직접_검색" if file_key == 'direct_input' else file_key)
+                safe_name = self._sanitize_filename(file_name)
+                markdown_content = self._create_all_laws_markdown(laws)
+                zip_file.writestr(f'{safe_name}.md', markdown_content)
+
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
     
@@ -1833,9 +1853,13 @@ def initialize_session_state():
     defaults = {
         'mode': 'direct',
         'extracted_laws': [],
+        'file_extractions': {},
         'search_results': [],
+        'search_results_by_file': {},
         'selected_laws': [],
+        'selected_laws_by_file': {},
         'collected_laws': {},
+        'collected_laws_by_file': {},
         'file_processed': False,
         'openai_api_key': None,
         'use_ai': False,
@@ -2123,220 +2147,400 @@ def handle_file_upload_mode(oc_code: str):
     else:
         st.info("💡 AI 설정을 통해 법령명 추출 정확도를 높일 수 있습니다")
     
-    uploaded_file = st.file_uploader(
+    uploaded_files = st.file_uploader(
         "파일 선택",
         type=['pdf', 'xlsx', 'xls', 'md', 'txt'],
-        help="PDF, Excel, Markdown, 텍스트 파일을 지원합니다"
+        help="PDF, Excel, Markdown, 텍스트 파일을 지원합니다",
+        accept_multiple_files=True
     )
-    
-    if uploaded_file and not st.session_state.file_processed:
+
+    if uploaded_files:
         st.subheader("📋 STEP 1: 법령명 추출")
-        
-        with st.spinner("파일에서 법령명을 추출하는 중..."):
-            # API 키 전달 확인
-            logger.info(f"AI 사용 여부: {st.session_state.use_ai}")
-            logger.info(f"API 키 존재: {bool(st.session_state.openai_api_key)}")
-            
-            extractor = EnhancedLawFileExtractor(
-                use_ai=st.session_state.use_ai,
-                api_key=st.session_state.openai_api_key
-            )
-            
+
+        extractor = EnhancedLawFileExtractor(
+            use_ai=st.session_state.use_ai,
+            api_key=st.session_state.openai_api_key
+        )
+
+        newly_processed = []
+
+        for uploaded_file in uploaded_files:
             file_type = uploaded_file.name.split('.')[-1].lower()
-            
-            try:
-                extracted_laws = extractor.extract_from_file(uploaded_file, file_type)
-                
-                if extracted_laws:
-                    st.success(f"✅ {len(extracted_laws)}개의 법령명을 찾았습니다!")
-                    st.session_state.extracted_laws = extracted_laws
-                    st.session_state.file_processed = True
+            file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+
+            if file_key in st.session_state.file_extractions:
+                continue
+
+            with st.spinner(f"'{uploaded_file.name}'에서 법령명을 추출하는 중..."):
+                try:
+                    uploaded_file.seek(0)
+                    extracted_laws = extractor.extract_from_file(uploaded_file, file_type)
+
+                    st.session_state.file_extractions[file_key] = {
+                        'file_name': uploaded_file.name,
+                        'file_type': file_type,
+                        'laws': extracted_laws,
+                        'edited_laws': extracted_laws.copy()
+                    }
+
+                    newly_processed.append((uploaded_file.name, len(extracted_laws)))
+
+                except Exception as e:
+                    st.error(f"파일 처리 오류 ({uploaded_file.name}): {str(e)}")
+                    logger.error(f"파일 처리 오류: {e}", exc_info=True)
+
+        if newly_processed:
+            for name, count in newly_processed:
+                if count:
+                    st.success(f"✅ {name}: {count}개의 법령명을 찾았습니다!")
                 else:
-                    st.warning("파일에서 법령명을 찾을 수 없습니다")
-                    
-            except Exception as e:
-                st.error(f"파일 처리 오류: {str(e)}")
-                logger.error(f"파일 처리 오류: {e}", exc_info=True)
-    
+                    st.warning(f"⚠️ {name}: 법령명을 찾지 못했습니다")
+
+        st.session_state.file_processed = bool(st.session_state.file_extractions)
+
+        # 전체 리스트도 유지 (기존 기능 호환)
+        st.session_state.extracted_laws = [
+            law
+            for data in st.session_state.file_extractions.values()
+            for law in data.get('edited_laws', [])
+        ]
+
     # 추출된 법령 표시
-    if st.session_state.extracted_laws:
+    if st.session_state.file_extractions:
         display_extracted_laws(oc_code)
 
 
 def display_extracted_laws(oc_code: str):
     """추출된 법령 표시 및 편집"""
     st.subheader("✏️ STEP 2: 법령명 확인 및 편집")
-    
-    # 추출된 법령 목록
-    st.write("**추출된 법령명:**")
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        for idx, law in enumerate(st.session_state.extracted_laws, 1):
-            # 행정규칙 키워드 체크
-            is_admin = any(k in law for k in LawPatterns.ADMIN_KEYWORDS)
-            emoji = "📋" if is_admin else "📖"
-            st.write(f"{idx}. {emoji} {law}")
-    
-    with col2:
-        st.metric("총 법령", len(st.session_state.extracted_laws))
-        admin_count = sum(1 for law in st.session_state.extracted_laws 
-                         if any(k in law for k in LawPatterns.ADMIN_KEYWORDS))
-        if admin_count > 0:
-            st.metric("행정규칙", admin_count)
-    
-    # 편집 영역
-    edited_laws = []
-    st.write("\n**법령명 편집:**")
-    
-    for idx, law_name in enumerate(st.session_state.extracted_laws):
-        col1, col2 = st.columns([4, 1])
-        with col1:
-            edited_name = st.text_input(
-                f"법령 {idx+1}",
-                value=law_name,
-                key=f"edit_{idx}"
+
+    file_extractions = st.session_state.file_extractions
+    removal_queue = []
+
+    total_law_count = 0
+    total_admin_count = 0
+
+    for file_key, data in file_extractions.items():
+        laws_for_file = data.get('edited_laws', [])
+        total_law_count += len(laws_for_file)
+        total_admin_count += sum(1 for law in laws_for_file
+                                 if any(k in law for k in LawPatterns.ADMIN_KEYWORDS))
+
+        with st.expander(f"📄 {data['file_name']} ({len(laws_for_file)}개)", expanded=True):
+            st.caption("한 줄에 하나씩 법령명을 입력하거나 수정할 수 있습니다.")
+
+            default_text = "\n".join(laws_for_file)
+            edited_text = st.text_area(
+                "법령명 목록",
+                value=default_text,
+                height=200,
+                key=f"law_area_{file_key}"
             )
-            if edited_name:
-                edited_laws.append(edited_name)
-        with col2:
-            if st.button("삭제", key=f"del_{idx}"):
-                st.session_state.extracted_laws.pop(idx)
-                st.rerun()
-    
-    # 법령명 추가
-    st.subheader("법령명 추가")
-    new_law = st.text_input("새 법령명 입력", key="new_law_input")
-    if st.button("➕ 추가") and new_law:
-        st.session_state.extracted_laws.append(new_law)
-        st.rerun()
-    
+
+            updated_laws = [line.strip() for line in edited_text.split('\n') if line.strip()]
+            st.session_state.file_extractions[file_key]['edited_laws'] = updated_laws
+
+            col_a, col_b = st.columns([3, 1])
+            with col_a:
+                new_law = st.text_input(
+                    "새 법령명 추가",
+                    key=f"new_law_{file_key}"
+                )
+                if st.button("➕ 추가", key=f"add_btn_{file_key}"):
+                    if new_law and new_law.strip():
+                        updated_laws.append(new_law.strip())
+                        st.session_state.file_extractions[file_key]['edited_laws'] = updated_laws
+                        st.success(f"'{new_law.strip()}'을(를) 추가했습니다")
+                        st.session_state.extracted_laws = [
+                            law
+                            for item in st.session_state.file_extractions.values()
+                            for law in item.get('edited_laws', [])
+                        ]
+                        st.experimental_rerun()
+                    else:
+                        st.warning("추가할 법령명을 입력해주세요")
+
+            with col_b:
+                st.metric("법령 수", len(updated_laws))
+                if st.button("🗑️ 파일 제거", key=f"remove_{file_key}"):
+                    removal_queue.append(file_key)
+
+    if removal_queue:
+        for key in removal_queue:
+            st.session_state.file_extractions.pop(key, None)
+        # 관련 상태 정리
+        for state_key in ['search_results_by_file', 'selected_laws_by_file', 'collected_laws_by_file']:
+            if state_key in st.session_state:
+                for key in removal_queue:
+                    if key in st.session_state[state_key]:
+                        st.session_state[state_key].pop(key, None)
+
+        # 전체 리스트 갱신
+        st.session_state.extracted_laws = [
+            law
+            for item in st.session_state.file_extractions.values()
+            for law in item.get('edited_laws', [])
+        ]
+
+        st.experimental_rerun()
+
+    summary_col1, summary_col2 = st.columns(2)
+    with summary_col1:
+        st.metric("총 법령", total_law_count)
+    with summary_col2:
+        st.metric("추정 행정규칙", total_admin_count)
+
+    st.session_state.extracted_laws = [
+        law
+        for item in st.session_state.file_extractions.values()
+        for law in item.get('edited_laws', [])
+    ]
+
     # 검색 버튼
-    if st.button("🔍 법령 검색", type="primary", use_container_width=True):
+    if st.button("🔍 모든 파일에서 법령 검색", type="primary", use_container_width=True):
         if not oc_code:
             st.error("기관코드를 입력해주세요!")
         else:
-            # 파일 업로드 모드로 검색 (변형 검색 사용하지 않음)
-            search_laws_from_list(oc_code, edited_laws or st.session_state.extracted_laws, is_from_file=True)
+            # 파일별 검색 요청 생성
+            law_requests = []
+            for file_key, data in st.session_state.file_extractions.items():
+                for order, law_name in enumerate(data.get('edited_laws', [])):
+                    law_requests.append({
+                        'file_key': file_key,
+                        'file_name': data['file_name'],
+                        'law_name': law_name,
+                        'order': order
+                    })
+
+            if law_requests:
+                st.session_state.search_requests = law_requests
+                search_laws_from_list(oc_code, law_requests, is_from_file=True)
+            else:
+                st.warning("검색할 법령명이 없습니다. 목록을 확인해주세요.")
 
 
-def search_laws_from_list(oc_code: str, law_names: List[str], is_from_file: bool = True):
-    """법령 목록 검색
-    
-    Args:
-        oc_code: 기관코드
-        law_names: 검색할 법령명 리스트
-        is_from_file: 파일에서 추출된 법령인지 여부 (기본값: True)
-                     - True: 법령체계도 모드 (정확한 검색)
-                     - False: 직접 입력 모드 (변형 검색)
-    """
+def search_laws_from_list(oc_code: str, law_inputs: List[Any], is_from_file: bool = True):
+    """파일 또는 입력에서 수집한 법령명을 검색"""
+
     collector = LawCollectorAPI(oc_code)
-    
+
+    law_requests: Optional[List[Dict[str, Any]]] = None
+    law_names: List[str] = []
+
+    if law_inputs:
+        if isinstance(law_inputs[0], dict):
+            law_requests = [cast(Dict[str, Any], item) for item in law_inputs]  # type: ignore[misc]
+            law_names = [req['law_name'] for req in law_requests]
+        else:
+            law_names = [str(name) for name in law_inputs]
+
+    if not law_names:
+        st.warning("검색할 법령명이 없습니다.")
+        st.session_state.search_results = []
+        st.session_state.search_results_by_file = {}
+        return None
+
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     def update_progress(progress):
         progress_bar.progress(progress)
-    
-    # 모드 표시
+
     if is_from_file:
         st.info("📋 법령체계도 모드: 추출된 법령명과 정확히 일치하는 법령만 검색합니다.")
     else:
         st.info("🔍 직접 검색 모드: 띄어쓰기 변형 등을 포함하여 포괄적으로 검색합니다.")
-    
+
     with st.spinner("법령을 검색하는 중..."):
-        # use_variations 파라미터를 모드에 따라 설정
         results = collector.search_laws(
-            law_names, 
+            law_names,
             progress_callback=update_progress,
-            use_variations=(not is_from_file)  # 파일 모드일 때는 False
+            use_variations=(not is_from_file)
         )
-    
+
     progress_bar.progress(1.0)
     status_text.text("검색 완료!")
-    
+
+    results_by_file: Dict[str, List[Dict[str, Any]]] = {}
+
+    if law_requests:
+        request_map: Dict[str, List[Dict[str, Any]]] = {}
+        for req in law_requests:
+            request_map.setdefault(req['law_name'], []).append(req)
+
+        results_by_query: Dict[str, List[Dict[str, Any]]] = {}
+        for result in results:
+            results_by_query.setdefault(result['search_query'], []).append(result)
+
+        for law_name, requests in request_map.items():
+            matches = results_by_query.get(law_name, [])
+            if not matches:
+                continue
+
+            unique_matches: Dict[str, Dict[str, Any]] = {}
+            for match in matches:
+                unique_matches.setdefault(match['law_id'], match)
+
+            for req in requests:
+                bucket = results_by_file.setdefault(req['file_key'], [])
+                for match in unique_matches.values():
+                    law_copy = match.copy()
+                    law_copy['source_file_key'] = req['file_key']
+                    law_copy['source_file_name'] = req['file_name']
+                    law_copy['source_law_name'] = req['law_name']
+                    law_copy['source_order'] = req['order']
+                    bucket.append(law_copy)
+
+        results = [
+            law
+            for laws in results_by_file.values()
+            for law in laws
+        ]
+
+    st.session_state.search_results_by_file = results_by_file
+
     if results:
         st.success(f"✅ 총 {len(results)}개의 법령을 찾았습니다!")
-        
-        # 행정규칙 통계
+
         admin_count = sum(1 for r in results if r.get('is_admin_rule'))
         if admin_count > 0:
             st.info(f"📋 이 중 {admin_count}개는 행정규칙입니다.")
-        
-        # 법령체계도 모드에서는 추가 정보 표시
+
         if is_from_file:
             with st.expander("💡 검색 모드 정보"):
                 st.write("**법령체계도 모드**에서는 다음과 같이 작동합니다:")
                 st.write("- ✅ 추출된 법령명과 정확히 일치하는 법령만 검색")
                 st.write("- ❌ 띄어쓰기 변형이나 유사 법령명 검색하지 않음")
                 st.write("- 💡 법령체계도에 명시된 법령만 수집하여 정확성 보장")
-        
+
         st.session_state.search_results = results
+
+        if law_requests:
+            for file_key, laws in results_by_file.items():
+                file_name = next(
+                    (req['file_name'] for req in law_requests if req['file_key'] == file_key),
+                    file_key
+                )
+                st.caption(f"📁 {file_name}: {len(laws)}건 검색")
     else:
+        st.session_state.search_results = []
         st.warning("검색 결과가 없습니다")
+
+    return None
 
 
 def display_search_results_and_collect(oc_code: str):
     """검색 결과 표시 및 수집"""
-    if not st.session_state.search_results:
+    results_by_file = st.session_state.get('search_results_by_file', {})
+
+    if not st.session_state.search_results and not any(results_by_file.values()):
         return
-        
+
     st.subheader("📑 검색 결과")
-    
-    # 전체 선택
-    select_all = st.checkbox("전체 선택")
-    
-    # 테이블 헤더
-    cols = st.columns([1, 1, 3, 2, 2, 2])
-    headers = ["선택", "유형", "법령명", "법종구분", "시행일자", "검색어"]
-    for col, header in zip(cols, headers):
-        col.markdown(f"**{header}**")
-    
-    st.divider()
-    
-    # 결과 표시
-    selected_indices = []
-    for idx, law in enumerate(st.session_state.search_results):
+
+    selected_laws_by_file: Dict[str, List[Dict[str, Any]]] = {}
+
+    if results_by_file:
+        for file_key, laws in results_by_file.items():
+            if not laws:
+                continue
+
+            file_name = st.session_state.file_extractions.get(file_key, {}).get('file_name', file_key)
+            st.markdown(f"### 📄 {file_name}")
+
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "법령명", "법종구분", "검색어"]
+            for col, header in zip(cols, headers):
+                col.markdown(f"**{header}**")
+
+            select_all_file = st.checkbox("전체 선택", key=f"select_all_{file_key}")
+
+            file_selected: List[Dict[str, Any]] = []
+            for idx, law in enumerate(laws):
+                row_cols = st.columns([1, 1, 3, 2, 2])
+
+                with row_cols[0]:
+                    if st.checkbox(
+                        "선택",
+                        key=f"sel_{file_key}_{idx}",
+                        value=select_all_file,
+                        label_visibility="collapsed"
+                    ):
+                        file_selected.append(law)
+
+                with row_cols[1]:
+                    st.write("📋" if law.get('is_admin_rule') else "📖")
+
+                with row_cols[2]:
+                    st.write(law['law_name'])
+
+                with row_cols[3]:
+                    st.write(law.get('law_type', ''))
+
+                with row_cols[4]:
+                    st.write(law.get('source_law_name', law.get('search_query', '')))
+
+            selected_laws_by_file[file_key] = file_selected
+
+            st.divider()
+    else:
+        # 직접 검색 모드 (파일 없음)용 기존 테이블 유지
+        select_all = st.checkbox("전체 선택")
         cols = st.columns([1, 1, 3, 2, 2, 2])
-        
-        with cols[0]:
-            # 빈 레이블 경고 해결: label_visibility 사용
-            if st.checkbox("선택", key=f"sel_{idx}", value=select_all, label_visibility="collapsed"):
-                selected_indices.append(idx)
-        
-        with cols[1]:
-            # 유형 아이콘
-            if law.get('is_admin_rule'):
-                st.write("📋")  # 행정규칙
-            else:
-                st.write("📖")  # 일반 법령
-        
-        with cols[2]:
-            st.write(law['law_name'])
-        
-        with cols[3]:
-            st.write(law.get('law_type', ''))
-        
-        with cols[4]:
-            st.write(law.get('enforcement_date', ''))
-        
-        with cols[5]:
-            st.write(law.get('search_query', ''))
-    
-    # 선택된 법령 저장
-    st.session_state.selected_laws = [
-        st.session_state.search_results[i] for i in selected_indices
+        headers = ["선택", "유형", "법령명", "법종구분", "시행일자", "검색어"]
+        for col, header in zip(cols, headers):
+            col.markdown(f"**{header}**")
+
+        st.divider()
+
+        selected_indices = []
+        for idx, law in enumerate(st.session_state.search_results):
+            row_cols = st.columns([1, 1, 3, 2, 2, 2])
+
+            with row_cols[0]:
+                if st.checkbox(
+                    "선택",
+                    key=f"sel_direct_{idx}",
+                    value=select_all,
+                    label_visibility="collapsed"
+                ):
+                    selected_indices.append(idx)
+
+            with row_cols[1]:
+                st.write("📋" if law.get('is_admin_rule') else "📖")
+
+            with row_cols[2]:
+                st.write(law['law_name'])
+
+            with row_cols[3]:
+                st.write(law.get('law_type', ''))
+
+            with row_cols[4]:
+                st.write(law.get('enforcement_date', ''))
+
+            with row_cols[5]:
+                st.write(law.get('search_query', ''))
+
+        direct_selection = [st.session_state.search_results[i] for i in selected_indices]
+        if direct_selection:
+            selected_laws_by_file['direct_input'] = direct_selection
+
+    st.session_state.selected_laws_by_file = selected_laws_by_file
+
+    flattened_selected = [
+        law
+        for laws in selected_laws_by_file.values()
+        for law in laws
     ]
-    
-    if st.session_state.selected_laws:
-        st.success(f"{len(st.session_state.selected_laws)}개 법령이 선택되었습니다")
-        
-        # 선택된 행정규칙 개수
-        selected_admin = sum(1 for law in st.session_state.selected_laws 
-                           if law.get('is_admin_rule'))
+    st.session_state.selected_laws = flattened_selected
+
+    if flattened_selected:
+        st.success(f"{len(flattened_selected)}개 법령이 선택되었습니다")
+
+        selected_admin = sum(1 for law in flattened_selected if law.get('is_admin_rule'))
         if selected_admin > 0:
             st.info(f"📋 선택된 행정규칙: {selected_admin}개")
-        
-        # 수집 버튼
+
         if st.button("📥 선택한 법령 수집", type="primary", use_container_width=True):
             collect_selected_laws(oc_code)
 
@@ -2421,7 +2625,21 @@ def collect_selected_laws(oc_code: str):
                 st.write(f"- {law_name}")
     
     st.session_state.collected_laws = collected
-    
+
+    collected_by_file: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for file_key, laws in st.session_state.get('selected_laws_by_file', {}).items():
+        for law in laws:
+            law_id = law.get('law_id')
+            if not law_id:
+                continue
+            detail = collected.get(law_id)
+            if not detail:
+                continue
+            target = collected_by_file.setdefault(file_key, {})
+            target[law_id] = detail
+
+    st.session_state.collected_laws_by_file = collected_by_file
+
     # 통계 표시
     display_collection_stats(collected)
 
@@ -2511,7 +2729,7 @@ def display_download_section():
     else:
         # 통합 파일 - 명확한 형식 선택
         st.info("📌 단일 파일로 모든 법령을 통합하여 다운로드합니다.")
-        
+
         # 형식별 설명 추가
         format_descriptions = {
             "JSON": "구조화된 데이터 형식 (프로그래밍 활용에 적합)",
@@ -2556,7 +2774,30 @@ def display_download_section():
         # 미리보기 옵션
         with st.expander("📄 내용 미리보기 (처음 1000자)"):
             st.text(content[:1000] + "..." if len(content) > 1000 else content)
-    
+
+    file_grouped = {
+        key: laws
+        for key, laws in st.session_state.get('collected_laws_by_file', {}).items()
+        if laws
+    }
+
+    if file_grouped:
+        st.subheader("🗂️ 파일별 Markdown 묶음")
+        st.caption("업로드한 각 파일별로 통합된 Markdown 문서를 ZIP으로 제공합니다.")
+
+        file_bundle = exporter.export_markdown_by_file(
+            file_grouped,
+            st.session_state.get('file_extractions', {})
+        )
+
+        st.download_button(
+            label="🗂️ 파일별 Markdown ZIP 다운로드",
+            data=file_bundle,
+            file_name=f"file_grouped_markdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            mime="application/zip",
+            use_container_width=True
+        )
+
     # 수집 결과 상세
     with st.expander("📊 수집 결과 상세"):
         for law_id, law in st.session_state.collected_laws.items():
