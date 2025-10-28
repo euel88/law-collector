@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import base64
 import urllib.parse
+from collections import defaultdict, deque
 
 # 로깅 설정
 logging.basicConfig(
@@ -633,6 +634,7 @@ class LawCollectorAPI:
         self.logger = logging.getLogger(self.__class__.__name__)
         self.session = self._create_session()
         self._cache = {}  # 검색 결과 캐시
+        self.patterns = LawPatterns()
         
     @lru_cache(maxsize=128)
     def _get_cached_search_result(self, law_name: str) -> Optional[str]:
@@ -1101,11 +1103,12 @@ class LawCollectorAPI:
         
         return content
     
-    def collect_law_details(self, laws: List[Dict[str, Any]], 
-                           progress_callback=None) -> Dict[str, Dict[str, Any]]:
-        """법령 상세 정보 병렬 수집"""
-        collected = {}
-        
+    def collect_law_details(self, laws: List[Dict[str, Any]],
+                           progress_callback=None,
+                           expand_hierarchy: bool = False) -> Dict[str, Dict[str, Any]]:
+        """법령 상세 정보 병렬 수집 및 선택 시 계층 확장"""
+        collected: Dict[str, Dict[str, Any]] = {}
+
         with ThreadPoolExecutor(max_workers=self.config.MAX_CONCURRENT) as executor:
             # 수집 작업 제출
             future_to_law = {
@@ -1127,20 +1130,170 @@ class LawCollectorAPI:
                     detail = future.result()
                     if detail:
                         collected[law['law_id']] = detail
-                        
+
                     if progress_callback:
                         progress_callback((idx + 1) / len(laws))
-                        
+
                 except Exception as e:
                     self.logger.error(f"{law['law_name']} 수집 오류: {e}")
-                    
+
+        if expand_hierarchy and collected:
+            self._expand_related_laws(collected)
+
         return collected
     
-    def _get_law_detail(self, law_id: str, law_msn: str, 
+    def _expand_related_laws(self, collected: Dict[str, Dict[str, Any]],
+                             max_depth: int = 2) -> None:
+        """선택된 법령의 관계를 추적하여 시행령·시행규칙·행정규칙을 자동 확장"""
+        processed_ids = set(collected.keys())
+        seen_candidates: Set[Tuple[str, str]] = set()
+        queue: deque[Tuple[str, int]] = deque((law_id, 0) for law_id in collected.keys())
+
+        while queue:
+            current_id, depth = queue.popleft()
+            current_detail = collected.get(current_id)
+            if not current_detail:
+                continue
+
+            if depth >= max_depth:
+                continue
+
+            candidates = self._generate_hierarchy_candidates(current_detail)
+            for related_name in current_detail.get('related_law_names', []) or []:
+                candidates.append(("관련 법령", related_name))
+
+            for relation, candidate_name in candidates:
+                normalized_candidate = self._normalize_law_name(candidate_name)
+                if not normalized_candidate:
+                    continue
+
+                candidate_key = (relation, normalized_candidate)
+                if candidate_key in seen_candidates:
+                    continue
+                seen_candidates.add(candidate_key)
+
+                search_results = self._search_exact_match(candidate_name)
+                for result in search_results:
+                    result_id = result.get('law_id')
+                    result_msn = result.get('law_msn')
+
+                    if not result_id or result_id in processed_ids:
+                        continue
+
+                    detail = self._get_law_detail(
+                        result_id,
+                        result_msn,
+                        result.get('law_name', candidate_name),
+                        result.get('is_admin_rule', False)
+                    )
+
+                    if not detail:
+                        continue
+
+                    detail.setdefault('related_laws', [])
+                    detail['parent_law_id'] = current_id
+                    detail['relationship_from_parent'] = relation
+                    detail['source_candidate'] = candidate_name
+
+                    collected[result_id] = detail
+                    processed_ids.add(result_id)
+                    queue.append((result_id, depth + 1))
+
+                    current_detail.setdefault('related_laws', [])
+                    current_detail['related_laws'].append({
+                        'law_id': result_id,
+                        'law_name': detail['law_name'],
+                        'relationship': relation,
+                        'is_admin_rule': detail.get('is_admin_rule', False)
+                    })
+
+    def _generate_hierarchy_candidates(self, law_detail: Dict[str, Any]) -> List[Tuple[str, str]]:
+        """법령명을 바탕으로 시행령·시행규칙·행정규칙 후보 생성"""
+        law_name = law_detail.get('law_name', '').strip()
+        if not law_name:
+            return []
+
+        normalized_name = self._normalize_law_name(law_name)
+        candidates: List[Tuple[str, str]] = []
+        admin_base = self._prepare_admin_base(normalized_name)
+
+        def add_candidate(relation: str, candidate: str) -> None:
+            cleaned = self._normalize_law_name(candidate)
+            if cleaned and cleaned != normalized_name:
+                candidates.append((relation, cleaned))
+
+        if '시행령' in normalized_name:
+            base_name = normalized_name.replace(' 시행령', '').replace('시행령', '').strip()
+            if base_name:
+                add_candidate('모법', base_name)
+                add_candidate('시행규칙', f"{base_name} 시행규칙")
+                add_candidate('시행세칙', f"{base_name} 시행세칙")
+                self._add_admin_candidates(candidates, base_name)
+        elif any(suffix in normalized_name for suffix in ['시행규칙', '시행세칙']):
+            base_name = normalized_name
+            base_name = base_name.replace(' 시행규칙', '').replace('시행규칙', '')
+            base_name = base_name.replace(' 시행세칙', '').replace('시행세칙', '').strip()
+            if base_name:
+                add_candidate('모법', base_name)
+                add_candidate('시행령', f"{base_name} 시행령")
+                self._add_admin_candidates(candidates, base_name)
+        else:
+            add_candidate('시행령', f"{normalized_name} 시행령")
+            add_candidate('시행규칙', f"{normalized_name} 시행규칙")
+            add_candidate('시행세칙', f"{normalized_name} 시행세칙")
+            self._add_admin_candidates(candidates, normalized_name)
+
+        if admin_base and admin_base != normalized_name:
+            self._add_admin_candidates(candidates, admin_base)
+
+        # 중복 제거
+        unique_candidates: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        for relation, candidate in candidates:
+            key = (relation, candidate)
+            unique_candidates[key] = (relation, candidate)
+
+        return list(unique_candidates.values())
+
+    def _add_admin_candidates(self, bucket: List[Tuple[str, str]], base_name: str) -> None:
+        """행정규칙 가능성이 높은 후보를 버킷에 추가"""
+        admin_base = self._prepare_admin_base(base_name)
+        if not admin_base:
+            return
+
+        suffixes = [
+            '감독규정',
+            '감독업무시행세칙',
+            '업무시행세칙',
+            '감독규정 시행세칙',
+            '감독규정시행세칙',
+            '규정',
+            '고시',
+            '훈령',
+            '예규',
+            '지침'
+        ]
+
+        for suffix in suffixes:
+            candidate = f"{admin_base}{suffix}".strip()
+            if candidate and len(candidate) >= 3:
+                normalized_candidate = self._normalize_law_name(candidate)
+                if normalized_candidate:
+                    bucket.append(('행정규칙', normalized_candidate))
+
+    def _prepare_admin_base(self, base_name: str) -> str:
+        """행정규칙용 기본 명칭 생성"""
+        admin_base = base_name.strip()
+        for suffix in [' 법률', '법률', ' 법', '법']:
+            if admin_base.endswith(suffix):
+                admin_base = admin_base[:-len(suffix)]
+                break
+        return admin_base.strip()
+
+    def _get_law_detail(self, law_id: str, law_msn: str,
                        law_name: str, is_admin_rule: bool) -> Optional[Dict[str, Any]]:
         """법령 상세 정보 가져오기"""
         if is_admin_rule:
-            return self._get_admin_rule_detail(law_msn, law_name)
+            return self._get_admin_rule_detail(law_id, law_msn, law_name)
         else:
             return self._get_general_law_detail(law_id, law_msn, law_name)
     
@@ -1171,7 +1324,8 @@ class LawCollectorAPI:
             self.logger.error(f"법령 상세 조회 오류: {e}")
             return None
     
-    def _get_admin_rule_detail(self, law_msn: str, law_name: str) -> Optional[Dict[str, Any]]:
+    def _get_admin_rule_detail(self, law_id: str, law_msn: str,
+                               law_name: str) -> Optional[Dict[str, Any]]:
         """행정규칙 상세 정보 - ID 파라미터 사용"""
         params = {
             'OC': self.oc_code,
@@ -1179,7 +1333,7 @@ class LawCollectorAPI:
             'type': 'XML',
             'ID': law_msn  # MST가 아닌 ID 사용!
         }
-        
+
         try:
             self.logger.debug(f"행정규칙 상세 조회: {law_name}")
             self.logger.debug(f"파라미터: {params}")
@@ -1195,7 +1349,7 @@ class LawCollectorAPI:
                 return None
                 
             # 행정규칙 상세 파싱
-            return self._parse_admin_rule_detail(response.text, law_msn, law_name)
+            return self._parse_admin_rule_detail(response.text, law_id, law_msn, law_name)
             
         except Exception as e:
             self.logger.error(f"행정규칙 상세 조회 오류: {e}")
@@ -1217,7 +1371,9 @@ class LawCollectorAPI:
             'attachments': [],
             'attachment_pdfs': [],  # PDF 첨부파일 추가
             'raw_content': '',
-            'is_admin_rule': False
+            'is_admin_rule': False,
+            'related_laws': [],
+            'related_law_names': []
         }
         
         try:
@@ -1243,10 +1399,13 @@ class LawCollectorAPI:
             
             # 별표 추출
             self._extract_attachments(root, detail)
-            
+
             # PDF 첨부파일 추출 - 개선된 버전
             self._extract_pdf_attachments_enhanced(root, detail)
-            
+
+            # 관련 법령명 추출
+            detail['related_law_names'] = self._extract_related_law_names(root, law_name)
+
             # 원문 저장 (조문이 없는 경우)
             if not detail['articles']:
                 detail['raw_content'] = self._extract_full_text(root)
@@ -1258,11 +1417,11 @@ class LawCollectorAPI:
             
         return detail
     
-    def _parse_admin_rule_detail(self, content: str, law_msn: str, 
-                                law_name: str) -> Dict[str, Any]:
+    def _parse_admin_rule_detail(self, content: str, law_id: str,
+                                law_msn: str, law_name: str) -> Dict[str, Any]:
         """행정규칙 상세 정보 파싱"""
         detail = {
-            'law_id': '',
+            'law_id': law_id,
             'law_msn': law_msn,
             'law_name': law_name,
             'law_type': '',
@@ -1274,7 +1433,9 @@ class LawCollectorAPI:
             'attachments': [],
             'attachment_pdfs': [],  # PDF 첨부파일 추가
             'raw_content': '',
-            'is_admin_rule': True
+            'is_admin_rule': True,
+            'related_laws': [],
+            'related_law_names': []
         }
         
         try:
@@ -1308,21 +1469,82 @@ class LawCollectorAPI:
             
             # 별표 추출
             self._extract_attachments(root, detail)
-            
+
             # PDF 첨부파일 추출 - 개선된 버전
             self._extract_pdf_attachments_enhanced(root, detail)
-            
+
             # 원문 저장
             if not detail['articles']:
                 detail['raw_content'] = self._extract_full_text(root)
-                
+
+            # 관련 법령명 추출
+            detail['related_law_names'] = self._extract_related_law_names(root, law_name)
+
             self.logger.info(f"행정규칙 상세 파싱 완료: {law_name} - 조문 {len(detail['articles'])}개, 별표/별첨 {len(detail['attachments'])}개")
                 
         except Exception as e:
             self.logger.error(f"행정규칙 상세 파싱 오류: {e}")
-            
+
         return detail
-    
+
+    def _extract_related_law_names(self, root: ET.Element, current_name: str) -> List[str]:
+        """상세 XML에서 관련 법령명을 수집"""
+        related: Set[str] = set()
+        candidate_tags = ['관련법령', '관계법령', '연관법령', '법령체계도', '모법령', '하위법령']
+
+        for tag in candidate_tags:
+            for elem in root.findall(f'.//{tag}'):
+                text = self._collect_text_content(elem)
+                related.update(self._extract_law_names_from_text(text))
+
+        for elem in root.iter():
+            if '법령명' in elem.tag and elem.text:
+                name = self._normalize_candidate_name(elem.text)
+                if name:
+                    related.add(name)
+
+        current_normalized = self._normalize_law_name(current_name)
+        filtered = [name for name in related if name and name != current_normalized]
+        filtered.sort()
+        return filtered
+
+    def _collect_text_content(self, elem: ET.Element) -> str:
+        """요소 내부 텍스트를 공백으로 결합"""
+        parts = [text.strip() for text in elem.itertext() if text and text.strip()]
+        return ' '.join(parts)
+
+    def _extract_law_names_from_text(self, text: str) -> Set[str]:
+        """텍스트 블록에서 법령명 후보 추출"""
+        candidates: Set[str] = set()
+        if not text:
+            return candidates
+
+        segments = re.split(r'[\n\r,;·•▶\-]', text)
+        for segment in segments:
+            segment = segment.strip()
+            if not segment or len(segment) > 80:
+                continue
+
+            normalized = self._normalize_candidate_name(segment)
+            if not normalized or len(normalized) < 3:
+                continue
+
+            if any(keyword in normalized for keyword in self.patterns.LAW_TYPES):
+                candidates.add(normalized)
+
+        return candidates
+
+    def _normalize_candidate_name(self, name: str) -> str:
+        """관련 법령 후보명을 정규화"""
+        if not name:
+            return ''
+
+        cleaned = re.sub(r'\s+', ' ', name)
+        cleaned = re.sub(r'\(.*?\)', '', cleaned)
+        cleaned = re.sub(r'\[시행[^\]]*\]', '', cleaned)
+        cleaned = cleaned.strip(' -,:;')
+        return self._normalize_law_name(cleaned)
+
     def _extract_articles(self, root: ET.Element, detail: Dict[str, Any]) -> None:
         """조문 추출"""
         # 표준 조문 구조
@@ -2554,13 +2776,35 @@ def collect_selected_laws(oc_code: str):
     
     def update_progress(progress):
         progress_bar.progress(progress)
-        
+
     with st.spinner("법령 상세 정보를 수집하는 중..."):
+        selected_by_file = st.session_state.get('selected_laws_by_file', {})
+        expand_hierarchy = 'direct_input' in selected_by_file
         collected = collector.collect_law_details(
             st.session_state.selected_laws,
-            progress_callback=update_progress
+            progress_callback=update_progress,
+            expand_hierarchy=expand_hierarchy
         )
-    
+
+    def _law_key(law: Dict[str, Any]) -> Tuple[str, str]:
+        return (law.get('law_id') or '', law.get('law_msn') or '')
+
+    selected_keys = {_law_key(law) for law in st.session_state.selected_laws}
+    auto_added_ids = [
+        law_id
+        for law_id, detail in collected.items()
+        if (law_id, detail.get('law_msn') or '') not in selected_keys
+    ]
+
+    if auto_added_ids:
+        st.success(f"법령 체계 확장으로 {len(auto_added_ids)}개의 관련 법령을 추가로 수집했습니다.")
+        with st.expander("자동으로 추가된 법령 확인"):
+            for law_id in auto_added_ids:
+                law_detail = collected[law_id]
+                relation = law_detail.get('relationship_from_parent', '관련 법령')
+                emoji = "📋" if law_detail.get('is_admin_rule') else "📖"
+                st.write(f"{emoji} {law_detail['law_name']} ({relation})")
+
     # 별표/별첨 정보 표시
     total_attachments = sum(len(law.get('attachments', [])) for law in collected.values())
     if total_attachments > 0:
@@ -2627,7 +2871,7 @@ def collect_selected_laws(oc_code: str):
     st.session_state.collected_laws = collected
 
     collected_by_file: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for file_key, laws in st.session_state.get('selected_laws_by_file', {}).items():
+    for file_key, laws in selected_by_file.items():
         for law in laws:
             law_id = law.get('law_id')
             if not law_id:
@@ -2638,10 +2882,16 @@ def collect_selected_laws(oc_code: str):
             target = collected_by_file.setdefault(file_key, {})
             target[law_id] = detail
 
+    if auto_added_ids and 'direct_input' in selected_by_file:
+        direct_bucket = collected_by_file.setdefault('direct_input', {})
+        for law_id in auto_added_ids:
+            direct_bucket[law_id] = collected[law_id]
+
     st.session_state.collected_laws_by_file = collected_by_file
 
     # 통계 표시
     display_collection_stats(collected)
+    display_hierarchy_overview(collected)
 
 
 def extract_text_from_pdf(pdf_file) -> str:
@@ -2696,6 +2946,44 @@ def display_collection_stats(collected_laws: Dict[str, Dict[str, Any]]):
         st.metric("행정규칙", f"{admin_rule_count}개")
     with col5:
         st.metric("별표/별첨 텍스트", f"{total_attachment_chars:,}자")
+
+
+def display_hierarchy_overview(collected_laws: Dict[str, Dict[str, Any]]):
+    """자동 확장된 법령 계층을 트리 형태로 표시"""
+    if not collected_laws:
+        return
+
+    child_map: Dict[str, List[str]] = defaultdict(list)
+    for law_id, law in collected_laws.items():
+        parent_id = law.get('parent_law_id')
+        if parent_id and parent_id in collected_laws:
+            child_map[parent_id].append(law_id)
+
+    if not child_map:
+        return
+
+    for children in child_map.values():
+        children.sort(key=lambda cid: collected_laws[cid]['law_name'])
+
+    root_ids = [law_id for law_id, law in collected_laws.items() if not law.get('parent_law_id')]
+    root_ids.sort(key=lambda rid: collected_laws[rid]['law_name'])
+
+    def render_node(node_id: str, level: int = 0) -> None:
+        detail = collected_laws[node_id]
+        relation = detail.get('relationship_from_parent')
+        emoji = "📋" if detail.get('is_admin_rule') else "📖"
+        indent = "&nbsp;" * (level * 4)
+        label = f"{emoji} {detail['law_name']}"
+        if relation:
+            label += f" <span style='color:#888'>({relation})</span>"
+        st.markdown(f"{indent}- {label}", unsafe_allow_html=True)
+
+        for child_id in child_map.get(node_id, []):
+            render_node(child_id, level + 1)
+
+    with st.expander("🌳 자동으로 확장된 법령 체계도", expanded=True):
+        for root_id in root_ids:
+            render_node(root_id)
 
 
 def display_download_section():
