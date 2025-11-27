@@ -2594,6 +2594,181 @@ class LawExporter:
 
         zip_buffer.seek(0)
         return zip_buffer.getvalue()
+
+    def export_json_by_file(self,
+                            grouped_laws: Dict[str, Dict[str, Dict[str, Any]]],
+                            file_metadata: Dict[str, Dict[str, Any]]) -> bytes:
+        """파일별로 통합된 JSON 번들을 ZIP으로 반환"""
+        zip_buffer = BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_key, laws in grouped_laws.items():
+                if not laws:
+                    continue
+
+                meta = file_metadata.get(file_key, {})
+                file_name = meta.get('file_name') or ("직접_검색" if file_key == 'direct_input' else file_key)
+                safe_name = self._sanitize_filename(file_name)
+
+                json_data = {
+                    'source_file': file_name,
+                    'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'total_laws': len(laws),
+                    'admin_rule_count': sum(1 for law in laws.values() if law.get('is_admin_rule', False)),
+                    'laws': laws
+                }
+                json_content = json.dumps(json_data, ensure_ascii=False, indent=2)
+                zip_file.writestr(f'{safe_name}.json', json_content)
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    def export_text_by_file(self,
+                            grouped_laws: Dict[str, Dict[str, Dict[str, Any]]],
+                            file_metadata: Dict[str, Dict[str, Any]]) -> bytes:
+        """파일별로 통합된 Text 번들을 ZIP으로 반환"""
+        zip_buffer = BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_key, laws in grouped_laws.items():
+                if not laws:
+                    continue
+
+                meta = file_metadata.get(file_key, {})
+                file_name = meta.get('file_name') or ("직접_검색" if file_key == 'direct_input' else file_key)
+                safe_name = self._sanitize_filename(file_name)
+
+                lines = []
+                lines.append(f"원본 파일: {file_name}")
+                lines.append(f"수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                lines.append(f"총 법령 수: {len(laws)}개")
+                lines.append("=" * 80 + "\n")
+
+                for law_id, law in laws.items():
+                    lines.append(self._format_law_text(law))
+                    lines.append("\n" + "=" * 80 + "\n")
+
+                text_content = '\n'.join(lines)
+                zip_file.writestr(f'{safe_name}.txt', text_content)
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    def export_all_formats_by_file(self,
+                                   grouped_laws: Dict[str, Dict[str, Dict[str, Any]]],
+                                   file_metadata: Dict[str, Dict[str, Any]]) -> bytes:
+        """파일별로 모든 형식(JSON, Markdown, Text + 개별 법령)을 포함한 ZIP 반환"""
+        zip_buffer = BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for file_key, laws in grouped_laws.items():
+                if not laws:
+                    continue
+
+                meta = file_metadata.get(file_key, {})
+                file_name = meta.get('file_name') or ("직접_검색" if file_key == 'direct_input' else file_key)
+                safe_folder = self._sanitize_filename(file_name.rsplit('.', 1)[0] if '.' in file_name else file_name)
+
+                # 통합 파일들
+                # 1. JSON
+                json_data = {
+                    'source_file': file_name,
+                    'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'total_laws': len(laws),
+                    'admin_rule_count': sum(1 for law in laws.values() if law.get('is_admin_rule', False)),
+                    'laws': laws
+                }
+                zip_file.writestr(
+                    f'{safe_folder}/all_laws.json',
+                    json.dumps(json_data, ensure_ascii=False, indent=2)
+                )
+
+                # 2. Markdown
+                zip_file.writestr(
+                    f'{safe_folder}/all_laws.md',
+                    self._create_all_laws_markdown(laws)
+                )
+
+                # 3. Text
+                lines = []
+                lines.append(f"원본 파일: {file_name}")
+                lines.append(f"수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                lines.append(f"총 법령 수: {len(laws)}개")
+                lines.append("=" * 80 + "\n")
+                for law_id, law in laws.items():
+                    lines.append(self._format_law_text(law))
+                    lines.append("\n" + "=" * 80 + "\n")
+                zip_file.writestr(f'{safe_folder}/all_laws.txt', '\n'.join(lines))
+
+                # 개별 법령 파일들
+                for law_id, law in laws.items():
+                    safe_name = self._sanitize_filename(law['law_name'])
+
+                    # 개별 JSON
+                    zip_file.writestr(
+                        f'{safe_folder}/laws/{safe_name}.json',
+                        json.dumps(law, ensure_ascii=False, indent=2)
+                    )
+
+                    # 개별 Markdown
+                    zip_file.writestr(
+                        f'{safe_folder}/laws/{safe_name}.md',
+                        self._format_law_markdown(law)
+                    )
+
+                    # 개별 Text
+                    zip_file.writestr(
+                        f'{safe_folder}/laws/{safe_name}.txt',
+                        self._format_law_text(law)
+                    )
+
+                # README
+                zip_file.writestr(
+                    f'{safe_folder}/README.md',
+                    self._create_file_readme(file_name, laws)
+                )
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    def _create_file_readme(self, source_file: str, laws_dict: Dict[str, Dict[str, Any]]) -> str:
+        """파일별 README 생성"""
+        total_articles = sum(len(law.get('articles', [])) for law in laws_dict.values())
+        total_provisions = sum(len(law.get('supplementary_provisions', [])) for law in laws_dict.values())
+        total_attachments = sum(len(law.get('attachments', [])) for law in laws_dict.values())
+        admin_rule_count = sum(1 for law in laws_dict.values() if law.get('is_admin_rule', False))
+
+        content = f"""# 법령 수집 결과
+
+원본 파일: {source_file}
+수집 일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+총 법령 수: {len(laws_dict)}개
+
+## 파일 구조
+
+- `all_laws.json`: 전체 법령 데이터 (JSON)
+- `all_laws.md`: 전체 법령 통합 문서 (Markdown)
+- `all_laws.txt`: 전체 법령 텍스트
+- `laws/`: 개별 법령 파일
+  - `*.json`: 법령별 상세 데이터
+  - `*.md`: 법령별 Markdown
+  - `*.txt`: 법령별 텍스트
+
+## 통계
+
+- 총 조문 수: {total_articles:,}개
+- 총 부칙 수: {total_provisions}개
+- 총 별표/별첨 수: {total_attachments}개
+- 행정규칙 수: {admin_rule_count}개
+
+## 수집된 법령 목록
+
+"""
+        for idx, (law_id, law) in enumerate(laws_dict.items(), 1):
+            emoji = "📋" if law.get('is_admin_rule', False) else "📖"
+            content += f"{idx}. {emoji} {law['law_name']}\n"
+
+        return content
     
     def export_single_file(self, laws_dict: Dict[str, Dict[str, Any]], 
                           format: str = 'json') -> str:
@@ -3995,21 +4170,131 @@ def display_download_section():
     }
 
     if file_grouped:
-        st.subheader("🗂️ 파일별 Markdown 묶음")
-        st.caption("업로드한 각 파일별로 통합된 Markdown 문서를 ZIP으로 제공합니다.")
+        st.subheader("🗂️ 파일별 분류 다운로드")
+        st.caption("업로드한 각 파일별로 추출된 법령들을 묶어서 다운로드합니다.")
 
-        file_bundle = exporter.export_markdown_by_file(
-            file_grouped,
-            st.session_state.get('file_extractions', {})
+        # 파일별 통계 표시
+        file_extractions = st.session_state.get('file_extractions', {})
+        with st.expander("📊 파일별 수집 현황", expanded=True):
+            for file_key, laws in file_grouped.items():
+                meta = file_extractions.get(file_key, {})
+                file_name = meta.get('file_name') or ("직접 검색" if file_key == 'direct_input' else file_key)
+                law_count = len(laws)
+                admin_count = sum(1 for law in laws.values() if law.get('is_admin_rule', False))
+
+                col1, col2, col3 = st.columns([3, 1, 1])
+                with col1:
+                    st.write(f"📄 **{file_name}**")
+                with col2:
+                    st.write(f"법령: {law_count}개")
+                with col3:
+                    st.write(f"행정규칙: {admin_count}개")
+
+        # 파일별 다운로드 형식 선택
+        st.markdown("---")
+        file_format_option = st.radio(
+            "파일별 다운로드 형식",
+            ["전체 형식 (ZIP)", "JSON만", "Markdown만", "Text만"],
+            help="각 업로드 파일별로 추출된 법령을 선택한 형식으로 묶어서 다운로드합니다.",
+            key="file_format_option"
         )
 
+        format_descriptions = {
+            "전체 형식 (ZIP)": "각 파일별로 JSON, Markdown, Text 및 개별 법령 파일을 모두 포함한 ZIP",
+            "JSON만": "각 파일별로 통합된 JSON 파일을 ZIP으로 묶음",
+            "Markdown만": "각 파일별로 통합된 Markdown 파일을 ZIP으로 묶음",
+            "Text만": "각 파일별로 통합된 텍스트 파일을 ZIP으로 묶음"
+        }
+        st.caption(f"💡 {format_descriptions[file_format_option]}")
+
+        if file_format_option == "전체 형식 (ZIP)":
+            file_bundle = exporter.export_all_formats_by_file(
+                file_grouped,
+                file_extractions
+            )
+            label = "📦 파일별 전체 형식 ZIP 다운로드"
+            filename = f"file_grouped_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        elif file_format_option == "JSON만":
+            file_bundle = exporter.export_json_by_file(
+                file_grouped,
+                file_extractions
+            )
+            label = "📄 파일별 JSON ZIP 다운로드"
+            filename = f"file_grouped_json_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        elif file_format_option == "Markdown만":
+            file_bundle = exporter.export_markdown_by_file(
+                file_grouped,
+                file_extractions
+            )
+            label = "📝 파일별 Markdown ZIP 다운로드"
+            filename = f"file_grouped_markdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        else:  # Text만
+            file_bundle = exporter.export_text_by_file(
+                file_grouped,
+                file_extractions
+            )
+            label = "📃 파일별 Text ZIP 다운로드"
+            filename = f"file_grouped_text_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+
         st.download_button(
-            label="🗂️ 파일별 Markdown ZIP 다운로드",
+            label=label,
             data=file_bundle,
-            file_name=f"file_grouped_markdown_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+            file_name=filename,
             mime="application/zip",
             use_container_width=True
         )
+
+        # 개별 파일 다운로드 옵션
+        st.markdown("---")
+        st.markdown("##### 📁 개별 파일 다운로드")
+        st.caption("특정 업로드 파일의 법령만 개별적으로 다운로드할 수 있습니다.")
+
+        for file_key, laws in file_grouped.items():
+            meta = file_extractions.get(file_key, {})
+            file_name = meta.get('file_name') or ("직접 검색" if file_key == 'direct_input' else file_key)
+            safe_name = exporter._sanitize_filename(file_name.rsplit('.', 1)[0] if '.' in file_name else file_name)
+
+            with st.expander(f"📄 {file_name} ({len(laws)}개 법령)"):
+                single_file_format = st.selectbox(
+                    "다운로드 형식",
+                    ["JSON", "Markdown", "Text"],
+                    key=f"single_format_{file_key}"
+                )
+
+                # 선택된 형식으로 단일 파일 생성
+                if single_file_format == "JSON":
+                    json_data = {
+                        'source_file': file_name,
+                        'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'total_laws': len(laws),
+                        'laws': laws
+                    }
+                    content = json.dumps(json_data, ensure_ascii=False, indent=2)
+                    mime = "application/json"
+                    ext = "json"
+                elif single_file_format == "Markdown":
+                    content = exporter._create_all_laws_markdown(laws)
+                    mime = "text/markdown"
+                    ext = "md"
+                else:
+                    content = exporter._export_as_text(laws)
+                    mime = "text/plain"
+                    ext = "txt"
+
+                st.download_button(
+                    label=f"💾 {single_file_format} 다운로드",
+                    data=content,
+                    file_name=f"{safe_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}",
+                    mime=mime,
+                    key=f"download_{file_key}_{single_file_format}",
+                    use_container_width=True
+                )
+
+                # 법령 목록 표시
+                st.markdown("**포함된 법령:**")
+                for law_id, law in laws.items():
+                    emoji = "📋" if law.get('is_admin_rule', False) else "📖"
+                    st.write(f"- {emoji} {law['law_name']}")
 
     # 수집 결과 상세
     with st.expander("📊 수집 결과 상세"):
