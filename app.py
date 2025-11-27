@@ -411,7 +411,7 @@ class EnhancedLawFileExtractor:
                 # API 호출 - 안전한 방식으로
                 try:
                     response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
+                        model="gpt-5",
                         messages=[
                             {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                             {"role": "user", "content": prompt}
@@ -419,20 +419,20 @@ class EnhancedLawFileExtractor:
                         temperature=0.1,
                         max_tokens=1500
                     )
-                    
+
                     # 응답 파싱
                     ai_laws = self._parse_ai_response_enhanced(response.choices[0].message.content)
-                    
+
                     self.logger.info(f"AI가 추가로 {len(ai_laws - laws)}개의 법령을 찾았습니다.")
-                    
+
                     # 결과 병합
                     return laws.union(ai_laws)
-                    
+
                 except Exception as chat_error:
-                    # GPT-3.5가 실패하면 GPT-4 시도
+                    # gpt-5 실패 시 재시도
                     try:
                         response = client.chat.completions.create(
-                            model="gpt-4",
+                            model="gpt-5",
                             messages=[
                                 {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                                 {"role": "user", "content": prompt}
@@ -440,11 +440,11 @@ class EnhancedLawFileExtractor:
                             temperature=0.1,
                             max_tokens=1500
                         )
-                        
+
                         ai_laws = self._parse_ai_response_enhanced(response.choices[0].message.content)
-                        self.logger.info(f"GPT-4로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
+                        self.logger.info(f"GPT-5로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
                         return laws.union(ai_laws)
-                        
+
                     except:
                         self.logger.warning("AI 기능을 사용할 수 없습니다. 기본 추출만 수행합니다.")
                         return laws
@@ -2953,7 +2953,7 @@ def show_sidebar():
                                         try:
                                             # 가장 간단한 API 호출 - chat completion
                                             test_response = test_client.chat.completions.create(
-                                                model="gpt-3.5-turbo",
+                                                model="gpt-5",
                                                 messages=[{"role": "user", "content": "test"}],
                                                 max_tokens=1
                                             )
@@ -2966,12 +2966,11 @@ def show_sidebar():
                                                 if test_response and hasattr(test_response, 'data'):
                                                     success = True
                                             except:
-                                                # 구버전 API 호환
+                                                # gpt-5로 재시도
                                                 try:
-                                                    # 간단한 완료 테스트
-                                                    test_response = test_client.completions.create(
-                                                        model="text-davinci-003",
-                                                        prompt="test",
+                                                    test_response = test_client.chat.completions.create(
+                                                        model="gpt-5",
+                                                        messages=[{"role": "user", "content": "test"}],
                                                         max_tokens=1
                                                     )
                                                     success = True
