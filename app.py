@@ -1,5 +1,6 @@
 """
-법제처 법령 수집기 - PDF 다운로드 개선 및 OCR 지원 버전 (v6.9)
+법제처 법령 수집기 - 다양한 법률 데이터 지원 버전 (v7.0)
+- 자치법규, 판례, 헌재결정례, 법령해석례, 행정심판례, 조약 검색 지원
 - PDF 다운로드 로직 제거, OCR 텍스트 추출 기능 추가
 - 초기화 시 기관코드/API키 유지
 - 별표/별첨 텍스트 내용 자동 수집
@@ -1106,26 +1107,34 @@ class LawCollectorAPI:
     def collect_law_details(self, laws: List[Dict[str, Any]],
                            progress_callback=None,
                            expand_hierarchy: bool = False) -> Dict[str, Dict[str, Any]]:
-        """법령 상세 정보 병렬 수집 및 선택 시 계층 확장"""
+        """법령 상세 정보 병렬 수집 및 선택 시 계층 확장 - 다양한 데이터 유형 지원"""
         collected: Dict[str, Dict[str, Any]] = {}
 
         with ThreadPoolExecutor(max_workers=self.config.MAX_CONCURRENT) as executor:
-            # 수집 작업 제출
-            future_to_law = {
-                executor.submit(
-                    self._get_law_detail,
-                    law['law_id'],
-                    law['law_msn'],
-                    law['law_name'],
-                    law.get('is_admin_rule', False)
-                ): law
-                for law in laws
-            }
-            
+            # 수집 작업 제출 - 데이터 유형에 따라 다른 메서드 호출
+            future_to_law = {}
+            for law in laws:
+                data_type = law.get('data_type', '')
+
+                # 새로운 데이터 유형인 경우 get_detail_by_type 사용
+                if data_type in ['ordinance', 'precedent', 'constitutional',
+                                'interpretation', 'admin_decision', 'treaty']:
+                    future = executor.submit(self.get_detail_by_type, law)
+                else:
+                    # 기존 법령/행정규칙
+                    future = executor.submit(
+                        self._get_law_detail,
+                        law['law_id'],
+                        law.get('law_msn', ''),
+                        law['law_name'],
+                        law.get('is_admin_rule', False)
+                    )
+                future_to_law[future] = law
+
             # 결과 수집
             for idx, future in enumerate(as_completed(future_to_law)):
                 law = future_to_law[future]
-                
+
                 try:
                     detail = future.result()
                     if detail:
@@ -1721,14 +1730,792 @@ class LawCollectorAPI:
         """중복 제거"""
         seen = set()
         unique_laws = []
-        
+
         for law in laws:
             law_id = law['law_id']
             if law_id not in seen:
                 seen.add(law_id)
                 unique_laws.append(law)
-                
+
         return unique_laws
+
+    # ===== 자치법규 검색/조회 =====
+    def search_ordinance(self, query: str) -> List[Dict[str, Any]]:
+        """자치법규 검색 (target=ordin)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'ordin',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"자치법규 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_ordinance_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"자치법규 검색 오류: {e}")
+            return []
+
+    def _parse_ordinance_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """자치법규 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//law') or root.findall('.//ordin'):
+                result = {
+                    'law_id': item.findtext('자치법규ID', '') or item.findtext('법령ID', ''),
+                    'law_msn': item.findtext('자치법규일련번호', '') or item.findtext('법령일련번호', ''),
+                    'law_name': item.findtext('자치법규명', '') or item.findtext('법령명한글', ''),
+                    'law_type': '자치법규',
+                    'local_gov': item.findtext('자치단체명', '') or item.findtext('지자체명', ''),
+                    'promulgation_date': item.findtext('공포일자', ''),
+                    'enforcement_date': item.findtext('시행일자', ''),
+                    'data_type': 'ordinance',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"자치법규 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_ordinance_detail(self, ordin_id: str, ordin_msn: str, ordin_name: str) -> Optional[Dict[str, Any]]:
+        """자치법규 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'ordin',
+            'type': 'XML',
+            'ID': ordin_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_ordinance_detail(response.text, ordin_id, ordin_msn, ordin_name)
+
+        except Exception as e:
+            self.logger.error(f"자치법규 상세 조회 오류: {e}")
+            return None
+
+    def _parse_ordinance_detail(self, content: str, ordin_id: str, ordin_msn: str, ordin_name: str) -> Dict[str, Any]:
+        """자치법규 상세 정보 파싱"""
+        detail = {
+            'law_id': ordin_id,
+            'law_msn': ordin_msn,
+            'law_name': ordin_name,
+            'law_type': '자치법규',
+            'local_gov': '',
+            'promulgation_date': '',
+            'enforcement_date': '',
+            'articles': [],
+            'supplementary_provisions': [],
+            'attachments': [],
+            'raw_content': '',
+            'data_type': 'ordinance'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            # 기본 정보
+            detail['local_gov'] = root.findtext('.//자치단체명', '')
+            detail['promulgation_date'] = root.findtext('.//공포일자', '')
+            detail['enforcement_date'] = root.findtext('.//시행일자', '')
+
+            # 조문 추출
+            self._extract_articles(root, detail)
+
+            # 부칙 추출
+            self._extract_supplementary_provisions(root, detail)
+
+            # 별표 추출
+            self._extract_attachments(root, detail)
+
+            # 원문 저장
+            if not detail['articles']:
+                detail['raw_content'] = self._extract_full_text(root)
+
+        except Exception as e:
+            self.logger.error(f"자치법규 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 판례 검색/조회 =====
+    def search_precedent(self, query: str) -> List[Dict[str, Any]]:
+        """판례 검색 (target=prec)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'prec',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"판례 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_precedent_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"판례 검색 오류: {e}")
+            return []
+
+    def _parse_precedent_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """판례 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//prec'):
+                result = {
+                    'law_id': item.findtext('판례일련번호', ''),
+                    'law_msn': item.findtext('판례일련번호', ''),
+                    'law_name': item.findtext('사건명', ''),
+                    'law_type': '판례',
+                    'case_no': item.findtext('사건번호', ''),
+                    'court': item.findtext('법원명', ''),
+                    'decision_date': item.findtext('선고일자', ''),
+                    'decision_type': item.findtext('사건종류명', ''),
+                    'data_type': 'precedent',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"판례 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_precedent_detail(self, prec_id: str, prec_name: str) -> Optional[Dict[str, Any]]:
+        """판례 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'prec',
+            'type': 'XML',
+            'ID': prec_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_precedent_detail(response.text, prec_id, prec_name)
+
+        except Exception as e:
+            self.logger.error(f"판례 상세 조회 오류: {e}")
+            return None
+
+    def _parse_precedent_detail(self, content: str, prec_id: str, prec_name: str) -> Dict[str, Any]:
+        """판례 상세 정보 파싱"""
+        detail = {
+            'law_id': prec_id,
+            'law_msn': prec_id,
+            'law_name': prec_name,
+            'law_type': '판례',
+            'case_no': '',
+            'court': '',
+            'decision_date': '',
+            'decision_type': '',
+            'judgment_summary': '',
+            'judgment_content': '',
+            'reference_articles': '',
+            'reference_cases': '',
+            'raw_content': '',
+            'data_type': 'precedent'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            detail['case_no'] = root.findtext('.//사건번호', '')
+            detail['court'] = root.findtext('.//법원명', '')
+            detail['decision_date'] = root.findtext('.//선고일자', '')
+            detail['decision_type'] = root.findtext('.//사건종류명', '')
+            detail['judgment_summary'] = root.findtext('.//판시사항', '')
+            detail['judgment_content'] = root.findtext('.//판결요지', '') or root.findtext('.//전문', '')
+            detail['reference_articles'] = root.findtext('.//참조조문', '')
+            detail['reference_cases'] = root.findtext('.//참조판례', '')
+            detail['raw_content'] = root.findtext('.//전문', '')
+
+        except Exception as e:
+            self.logger.error(f"판례 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 헌재결정례 검색/조회 =====
+    def search_constitutional_decision(self, query: str) -> List[Dict[str, Any]]:
+        """헌재결정례 검색 (target=detc)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'detc',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"헌재결정례 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_constitutional_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"헌재결정례 검색 오류: {e}")
+            return []
+
+    def _parse_constitutional_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """헌재결정례 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//detc'):
+                result = {
+                    'law_id': item.findtext('헌재결정례일련번호', ''),
+                    'law_msn': item.findtext('헌재결정례일련번호', ''),
+                    'law_name': item.findtext('사건명', ''),
+                    'law_type': '헌재결정례',
+                    'case_no': item.findtext('사건번호', ''),
+                    'decision_date': item.findtext('종국일자', ''),
+                    'data_type': 'constitutional',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"헌재결정례 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_constitutional_detail(self, detc_id: str, detc_name: str) -> Optional[Dict[str, Any]]:
+        """헌재결정례 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'detc',
+            'type': 'XML',
+            'ID': detc_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_constitutional_detail(response.text, detc_id, detc_name)
+
+        except Exception as e:
+            self.logger.error(f"헌재결정례 상세 조회 오류: {e}")
+            return None
+
+    def _parse_constitutional_detail(self, content: str, detc_id: str, detc_name: str) -> Dict[str, Any]:
+        """헌재결정례 상세 정보 파싱"""
+        detail = {
+            'law_id': detc_id,
+            'law_msn': detc_id,
+            'law_name': detc_name,
+            'law_type': '헌재결정례',
+            'case_no': '',
+            'decision_date': '',
+            'case_type': '',
+            'judgment_summary': '',
+            'decision_summary': '',
+            'full_text': '',
+            'reference_articles': '',
+            'reference_cases': '',
+            'data_type': 'constitutional'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            detail['case_no'] = root.findtext('.//사건번호', '')
+            detail['decision_date'] = root.findtext('.//종국일자', '')
+            detail['case_type'] = root.findtext('.//사건종류명', '')
+            detail['judgment_summary'] = root.findtext('.//판시사항', '')
+            detail['decision_summary'] = root.findtext('.//결정요지', '')
+            detail['full_text'] = root.findtext('.//전문', '')
+            detail['reference_articles'] = root.findtext('.//참조조문', '')
+            detail['reference_cases'] = root.findtext('.//참조판례', '')
+
+        except Exception as e:
+            self.logger.error(f"헌재결정례 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 법령해석례 검색/조회 =====
+    def search_interpretation(self, query: str) -> List[Dict[str, Any]]:
+        """법령해석례 검색 (target=expc)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'expc',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"법령해석례 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_interpretation_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"법령해석례 검색 오류: {e}")
+            return []
+
+    def _parse_interpretation_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """법령해석례 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//expc'):
+                result = {
+                    'law_id': item.findtext('법령해석례일련번호', ''),
+                    'law_msn': item.findtext('법령해석례일련번호', ''),
+                    'law_name': item.findtext('안건명', ''),
+                    'law_type': '법령해석례',
+                    'case_no': item.findtext('안건번호', ''),
+                    'inquiry_org': item.findtext('질의기관명', ''),
+                    'reply_org': item.findtext('회신기관명', ''),
+                    'reply_date': item.findtext('회신일자', ''),
+                    'data_type': 'interpretation',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"법령해석례 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_interpretation_detail(self, expc_id: str, expc_name: str) -> Optional[Dict[str, Any]]:
+        """법령해석례 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'expc',
+            'type': 'XML',
+            'ID': expc_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_interpretation_detail(response.text, expc_id, expc_name)
+
+        except Exception as e:
+            self.logger.error(f"법령해석례 상세 조회 오류: {e}")
+            return None
+
+    def _parse_interpretation_detail(self, content: str, expc_id: str, expc_name: str) -> Dict[str, Any]:
+        """법령해석례 상세 정보 파싱"""
+        detail = {
+            'law_id': expc_id,
+            'law_msn': expc_id,
+            'law_name': expc_name,
+            'law_type': '법령해석례',
+            'case_no': '',
+            'interpretation_date': '',
+            'interpretation_org': '',
+            'inquiry_org': '',
+            'inquiry_summary': '',
+            'reply': '',
+            'reason': '',
+            'data_type': 'interpretation'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            detail['case_no'] = root.findtext('.//안건번호', '')
+            detail['interpretation_date'] = root.findtext('.//해석일자', '')
+            detail['interpretation_org'] = root.findtext('.//해석기관명', '')
+            detail['inquiry_org'] = root.findtext('.//질의기관명', '')
+            detail['inquiry_summary'] = root.findtext('.//질의요지', '')
+            detail['reply'] = root.findtext('.//회답', '')
+            detail['reason'] = root.findtext('.//이유', '')
+
+        except Exception as e:
+            self.logger.error(f"법령해석례 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 행정심판례 검색/조회 =====
+    def search_admin_decision(self, query: str) -> List[Dict[str, Any]]:
+        """행정심판례 검색 (target=decc)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'decc',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"행정심판례 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_admin_decision_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"행정심판례 검색 오류: {e}")
+            return []
+
+    def _parse_admin_decision_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """행정심판례 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//decc'):
+                result = {
+                    'law_id': item.findtext('행정심판재결례일련번호', ''),
+                    'law_msn': item.findtext('행정심판재결례일련번호', ''),
+                    'law_name': item.findtext('사건명', ''),
+                    'law_type': '행정심판례',
+                    'case_no': item.findtext('사건번호', ''),
+                    'disposal_date': item.findtext('처분일자', ''),
+                    'decision_date': item.findtext('의결일자', ''),
+                    'disposal_org': item.findtext('처분청', ''),
+                    'decision_org': item.findtext('재결청', ''),
+                    'decision_type': item.findtext('재결구분명', ''),
+                    'data_type': 'admin_decision',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"행정심판례 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_admin_decision_detail(self, decc_id: str, decc_name: str) -> Optional[Dict[str, Any]]:
+        """행정심판례 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'decc',
+            'type': 'XML',
+            'ID': decc_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_admin_decision_detail(response.text, decc_id, decc_name)
+
+        except Exception as e:
+            self.logger.error(f"행정심판례 상세 조회 오류: {e}")
+            return None
+
+    def _parse_admin_decision_detail(self, content: str, decc_id: str, decc_name: str) -> Dict[str, Any]:
+        """행정심판례 상세 정보 파싱"""
+        detail = {
+            'law_id': decc_id,
+            'law_msn': decc_id,
+            'law_name': decc_name,
+            'law_type': '행정심판례',
+            'case_no': '',
+            'disposal_date': '',
+            'decision_date': '',
+            'disposal_org': '',
+            'decision_org': '',
+            'decision_type': '',
+            'main_text': '',
+            'claim_purport': '',
+            'reason': '',
+            'decision_summary': '',
+            'data_type': 'admin_decision'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            detail['case_no'] = root.findtext('.//사건번호', '')
+            detail['disposal_date'] = root.findtext('.//처분일자', '')
+            detail['decision_date'] = root.findtext('.//의결일자', '')
+            detail['disposal_org'] = root.findtext('.//처분청', '')
+            detail['decision_org'] = root.findtext('.//재결청', '')
+            detail['decision_type'] = root.findtext('.//재결례유형명', '')
+            detail['main_text'] = root.findtext('.//주문', '')
+            detail['claim_purport'] = root.findtext('.//청구취지', '')
+            detail['reason'] = root.findtext('.//이유', '')
+            detail['decision_summary'] = root.findtext('.//재결요지', '')
+
+        except Exception as e:
+            self.logger.error(f"행정심판례 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 조약 검색/조회 =====
+    def search_treaty(self, query: str) -> List[Dict[str, Any]]:
+        """조약 검색 (target=trty)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'trty',
+            'type': 'XML',
+            'query': query,
+            'display': str(self.config.RESULTS_PER_PAGE),
+            'page': '1'
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.warning(f"조약 검색 실패: {response.status_code}")
+                return []
+
+            return self._parse_treaty_search_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"조약 검색 오류: {e}")
+            return []
+
+    def _parse_treaty_search_response(self, content: str, search_query: str) -> List[Dict[str, Any]]:
+        """조약 검색 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//trty'):
+                result = {
+                    'law_id': item.findtext('조약일련번호', ''),
+                    'law_msn': item.findtext('조약일련번호', ''),
+                    'law_name': item.findtext('조약명', ''),
+                    'law_type': '조약',
+                    'treaty_no': item.findtext('조약번호', ''),
+                    'signing_date': item.findtext('서명일자', ''),
+                    'enforcement_date': item.findtext('발효일자', ''),
+                    'country': item.findtext('체결국가', ''),
+                    'data_type': 'treaty',
+                    'search_query': search_query
+                }
+
+                if result['law_id'] and result['law_name']:
+                    results.append(result)
+
+        except ET.ParseError as e:
+            self.logger.error(f"조약 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_treaty_detail(self, treaty_id: str, treaty_name: str) -> Optional[Dict[str, Any]]:
+        """조약 상세 정보 조회"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'trty',
+            'type': 'XML',
+            'ID': treaty_id
+        }
+
+        try:
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                return None
+
+            return self._parse_treaty_detail(response.text, treaty_id, treaty_name)
+
+        except Exception as e:
+            self.logger.error(f"조약 상세 조회 오류: {e}")
+            return None
+
+    def _parse_treaty_detail(self, content: str, treaty_id: str, treaty_name: str) -> Dict[str, Any]:
+        """조약 상세 정보 파싱"""
+        detail = {
+            'law_id': treaty_id,
+            'law_msn': treaty_id,
+            'law_name': treaty_name,
+            'law_type': '조약',
+            'treaty_no': '',
+            'signing_date': '',
+            'enforcement_date': '',
+            'country': '',
+            'treaty_type': '',
+            'full_text': '',
+            'articles': [],
+            'data_type': 'treaty'
+        }
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            detail['treaty_no'] = root.findtext('.//조약번호', '')
+            detail['signing_date'] = root.findtext('.//서명일자', '')
+            detail['enforcement_date'] = root.findtext('.//발효일자', '')
+            detail['country'] = root.findtext('.//체결국가', '')
+            detail['treaty_type'] = root.findtext('.//조약유형', '')
+            detail['full_text'] = root.findtext('.//조약본문', '') or self._extract_full_text(root)
+
+            # 조문 추출
+            self._extract_articles(root, detail)
+
+        except Exception as e:
+            self.logger.error(f"조약 상세 파싱 오류: {e}")
+
+        return detail
+
+    # ===== 통합 검색 메서드 =====
+    def search_by_type(self, query: str, data_type: str) -> List[Dict[str, Any]]:
+        """데이터 유형별 검색"""
+        search_methods = {
+            'law': lambda q: self.search_single_law(q),
+            'ordinance': self.search_ordinance,
+            'precedent': self.search_precedent,
+            'constitutional': self.search_constitutional_decision,
+            'interpretation': self.search_interpretation,
+            'admin_decision': self.search_admin_decision,
+            'treaty': self.search_treaty
+        }
+
+        method = search_methods.get(data_type)
+        if method:
+            return method(query)
+        else:
+            self.logger.warning(f"지원하지 않는 데이터 유형: {data_type}")
+            return []
+
+    def get_detail_by_type(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """데이터 유형별 상세 정보 조회"""
+        data_type = item.get('data_type', 'law')
+
+        if data_type == 'ordinance':
+            return self.get_ordinance_detail(
+                item['law_id'], item.get('law_msn', ''), item['law_name']
+            )
+        elif data_type == 'precedent':
+            return self.get_precedent_detail(item['law_id'], item['law_name'])
+        elif data_type == 'constitutional':
+            return self.get_constitutional_detail(item['law_id'], item['law_name'])
+        elif data_type == 'interpretation':
+            return self.get_interpretation_detail(item['law_id'], item['law_name'])
+        elif data_type == 'admin_decision':
+            return self.get_admin_decision_detail(item['law_id'], item['law_name'])
+        elif data_type == 'treaty':
+            return self.get_treaty_detail(item['law_id'], item['law_name'])
+        else:
+            # 기본: 법령/행정규칙
+            return self._get_law_detail(
+                item['law_id'],
+                item.get('law_msn', ''),
+                item['law_name'],
+                item.get('is_admin_rule', False)
+            )
 
 
 # ===== 법령 내보내기 클래스 =====
@@ -2086,9 +2873,10 @@ def initialize_session_state():
         'openai_api_key': None,
         'use_ai': False,
         'oc_code': '',
-        'include_pdfs': False  # PDF 다운로드 옵션
+        'include_pdfs': False,  # PDF 다운로드 옵션
+        'current_data_type': 'law'  # 현재 선택된 데이터 유형
     }
-    
+
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
@@ -2310,52 +3098,101 @@ def test_admin_rule_search(oc_code: str):
 def handle_direct_search_mode(oc_code: str):
     """직접 검색 모드 처리"""
     st.header("🔍 직접 검색 모드")
-    
-    # 직접 검색 모드 설명
-    with st.info("💡 직접 검색 모드에서는 띄어쓰기 변형을 포함하여 최대한 많은 법령을 찾습니다."):
-        st.caption("예: '공인노무사법시행령' → '공인노무사법 시행령'도 함께 검색")
-    
-    law_name = st.text_input(
-        "법령명",
-        placeholder="예: 민법, 상법, 금융감독규정",
-        help="검색할 법령명을 입력하세요 (행정규칙도 검색 가능)"
+
+    # 데이터 유형 선택
+    st.subheader("📂 데이터 유형 선택")
+
+    data_type_options = {
+        "법령/행정규칙": "law",
+        "자치법규": "ordinance",
+        "판례": "precedent",
+        "헌재결정례": "constitutional",
+        "법령해석례": "interpretation",
+        "행정심판례": "admin_decision",
+        "조약": "treaty"
+    }
+
+    selected_type_label = st.selectbox(
+        "검색할 데이터 유형",
+        options=list(data_type_options.keys()),
+        index=0,
+        help="검색할 법률 데이터 유형을 선택하세요"
     )
-    
+
+    selected_data_type = data_type_options[selected_type_label]
+
+    # 데이터 유형별 설명
+    type_descriptions = {
+        "law": "💡 법령/행정규칙 검색: 띄어쓰기 변형을 포함하여 최대한 많은 법령을 찾습니다.",
+        "ordinance": "📜 자치법규 검색: 지방자치단체의 조례, 규칙 등을 검색합니다.",
+        "precedent": "⚖️ 판례 검색: 대법원 및 하급법원 판례를 검색합니다.",
+        "constitutional": "🏛️ 헌재결정례 검색: 헌법재판소의 결정례를 검색합니다.",
+        "interpretation": "📖 법령해석례 검색: 법제처 등의 법령 해석 사례를 검색합니다.",
+        "admin_decision": "📋 행정심판례 검색: 행정심판위원회의 재결례를 검색합니다.",
+        "treaty": "🌐 조약 검색: 국제 조약 및 협정을 검색합니다."
+    }
+
+    st.info(type_descriptions.get(selected_data_type, ""))
+
+    # 검색어 입력
+    placeholder_texts = {
+        "law": "예: 민법, 상법, 금융감독규정",
+        "ordinance": "예: 주차장, 환경, 청소년",
+        "precedent": "예: 손해배상, 계약해제",
+        "constitutional": "예: 위헌, 기본권",
+        "interpretation": "예: 임대차, 건축",
+        "admin_decision": "예: 영업정지, 허가취소",
+        "treaty": "예: 무역, 투자, 인권"
+    }
+
+    search_query = st.text_input(
+        "검색어",
+        placeholder=placeholder_texts.get(selected_data_type, "검색어를 입력하세요"),
+        help="검색할 키워드를 입력하세요"
+    )
+
     if st.button("🔍 검색", type="primary", use_container_width=True):
         if not oc_code:
             st.error("기관코드를 입력해주세요!")
-        elif not law_name:
-            st.error("법령명을 입력해주세요!")
+        elif not search_query:
+            st.error("검색어를 입력해주세요!")
         else:
-            with st.spinner(f"'{law_name}' 검색 중..."):
+            with st.spinner(f"'{search_query}' 검색 중... ({selected_type_label})"):
                 collector = LawCollectorAPI(oc_code)
-                
-                # 직접 검색은 변형 검색을 사용
-                results = collector._search_with_variations(law_name)
-                
+
+                # 데이터 유형에 따른 검색
+                if selected_data_type == "law":
+                    # 기존 법령/행정규칙 검색 (변형 검색 포함)
+                    results = collector._search_with_variations(search_query)
+                else:
+                    # 새로운 데이터 유형 검색
+                    results = collector.search_by_type(search_query, selected_data_type)
+
                 if results:
-                    st.success(f"{len(results)}개의 법령을 찾았습니다!")
-                    
-                    # 행정규칙 개수 표시
-                    admin_count = sum(1 for r in results if r.get('is_admin_rule'))
-                    if admin_count > 0:
-                        st.info(f"📋 이 중 {admin_count}개는 행정규칙입니다.")
-                    
-                    # 어떤 변형으로 찾았는지 표시
-                    variations_used = set()
-                    for r in results:
-                        if 'found_with_variation' in r:
-                            variations_used.add(r['found_with_variation'])
-                    
-                    if variations_used and len(variations_used) > 1:
-                        with st.expander("🔍 검색에 사용된 변형"):
-                            for var in variations_used:
-                                st.write(f"- {var}")
-                    
+                    st.success(f"{len(results)}개의 결과를 찾았습니다!")
+
+                    # 결과 유형별 정보 표시
+                    if selected_data_type == "law":
+                        admin_count = sum(1 for r in results if r.get('is_admin_rule'))
+                        if admin_count > 0:
+                            st.info(f"📋 이 중 {admin_count}개는 행정규칙입니다.")
+
+                        # 검색 변형 표시
+                        variations_used = set()
+                        for r in results:
+                            if 'found_with_variation' in r:
+                                variations_used.add(r['found_with_variation'])
+
+                        if variations_used and len(variations_used) > 1:
+                            with st.expander("🔍 검색에 사용된 변형"):
+                                for var in variations_used:
+                                    st.write(f"- {var}")
+
                     st.session_state.search_results = results
+                    st.session_state.current_data_type = selected_data_type
                 else:
                     st.warning("검색 결과가 없습니다.")
-                    st.info("💡 Tip: 띄어쓰기를 조정하거나 기관코드를 확인해보세요.")
+                    st.info("💡 Tip: 다른 키워드로 검색하거나 기관코드를 확인해보세요.")
                     st.session_state.search_results = []
 
 
@@ -2651,6 +3488,26 @@ def search_laws_from_list(oc_code: str, law_inputs: List[Any], is_from_file: boo
     return None
 
 
+def get_data_type_emoji(law: Dict[str, Any]) -> str:
+    """데이터 유형에 따른 이모지 반환"""
+    data_type = law.get('data_type', '')
+    type_emojis = {
+        'ordinance': '📜',
+        'precedent': '⚖️',
+        'constitutional': '🏛️',
+        'interpretation': '📖',
+        'admin_decision': '📋',
+        'treaty': '🌐'
+    }
+
+    if data_type in type_emojis:
+        return type_emojis[data_type]
+    elif law.get('is_admin_rule'):
+        return '📋'
+    else:
+        return '📖'
+
+
 def display_search_results_and_collect(oc_code: str):
     """검색 결과 표시 및 수집"""
     results_by_file = st.session_state.get('search_results_by_file', {})
@@ -2691,7 +3548,7 @@ def display_search_results_and_collect(oc_code: str):
                         file_selected.append(law)
 
                 with row_cols[1]:
-                    st.write("📋" if law.get('is_admin_rule') else "📖")
+                    st.write(get_data_type_emoji(law))
 
                 with row_cols[2]:
                     st.write(law['law_name'])
@@ -2707,9 +3564,33 @@ def display_search_results_and_collect(oc_code: str):
             st.divider()
     else:
         # 직접 검색 모드 (파일 없음)용 기존 테이블 유지
+        current_data_type = st.session_state.get('current_data_type', 'law')
+
         select_all = st.checkbox("전체 선택")
-        cols = st.columns([1, 1, 3, 2, 2, 2])
-        headers = ["선택", "유형", "법령명", "법종구분", "시행일자", "검색어"]
+
+        # 데이터 유형에 따라 헤더 조정
+        if current_data_type == 'precedent':
+            cols = st.columns([1, 1, 3, 2, 2, 2])
+            headers = ["선택", "유형", "사건명", "법원", "선고일자", "사건번호"]
+        elif current_data_type == 'constitutional':
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "사건명", "종국일자", "사건번호"]
+        elif current_data_type == 'interpretation':
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "안건명", "회신일자", "회신기관"]
+        elif current_data_type == 'admin_decision':
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "사건명", "의결일자", "재결구분"]
+        elif current_data_type == 'treaty':
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "조약명", "발효일자", "체결국가"]
+        elif current_data_type == 'ordinance':
+            cols = st.columns([1, 1, 3, 2, 2])
+            headers = ["선택", "유형", "자치법규명", "시행일자", "자치단체"]
+        else:
+            cols = st.columns([1, 1, 3, 2, 2, 2])
+            headers = ["선택", "유형", "법령명", "법종구분", "시행일자", "검색어"]
+
         for col, header in zip(cols, headers):
             col.markdown(f"**{header}**")
 
@@ -2717,7 +3598,12 @@ def display_search_results_and_collect(oc_code: str):
 
         selected_indices = []
         for idx, law in enumerate(st.session_state.search_results):
-            row_cols = st.columns([1, 1, 3, 2, 2, 2])
+            if current_data_type == 'precedent':
+                row_cols = st.columns([1, 1, 3, 2, 2, 2])
+            elif current_data_type in ['constitutional', 'interpretation', 'admin_decision', 'treaty', 'ordinance']:
+                row_cols = st.columns([1, 1, 3, 2, 2])
+            else:
+                row_cols = st.columns([1, 1, 3, 2, 2, 2])
 
             with row_cols[0]:
                 if st.checkbox(
@@ -2729,19 +3615,51 @@ def display_search_results_and_collect(oc_code: str):
                     selected_indices.append(idx)
 
             with row_cols[1]:
-                st.write("📋" if law.get('is_admin_rule') else "📖")
+                st.write(get_data_type_emoji(law))
 
             with row_cols[2]:
                 st.write(law['law_name'])
 
-            with row_cols[3]:
-                st.write(law.get('law_type', ''))
-
-            with row_cols[4]:
-                st.write(law.get('enforcement_date', ''))
-
-            with row_cols[5]:
-                st.write(law.get('search_query', ''))
+            # 데이터 유형에 따라 다른 필드 표시
+            if current_data_type == 'precedent':
+                with row_cols[3]:
+                    st.write(law.get('court', ''))
+                with row_cols[4]:
+                    st.write(law.get('decision_date', ''))
+                with row_cols[5]:
+                    st.write(law.get('case_no', ''))
+            elif current_data_type == 'constitutional':
+                with row_cols[3]:
+                    st.write(law.get('decision_date', ''))
+                with row_cols[4]:
+                    st.write(law.get('case_no', ''))
+            elif current_data_type == 'interpretation':
+                with row_cols[3]:
+                    st.write(law.get('reply_date', ''))
+                with row_cols[4]:
+                    st.write(law.get('reply_org', ''))
+            elif current_data_type == 'admin_decision':
+                with row_cols[3]:
+                    st.write(law.get('decision_date', ''))
+                with row_cols[4]:
+                    st.write(law.get('decision_type', ''))
+            elif current_data_type == 'treaty':
+                with row_cols[3]:
+                    st.write(law.get('enforcement_date', ''))
+                with row_cols[4]:
+                    st.write(law.get('country', ''))
+            elif current_data_type == 'ordinance':
+                with row_cols[3]:
+                    st.write(law.get('enforcement_date', ''))
+                with row_cols[4]:
+                    st.write(law.get('local_gov', ''))
+            else:
+                with row_cols[3]:
+                    st.write(law.get('law_type', ''))
+                with row_cols[4]:
+                    st.write(law.get('enforcement_date', ''))
+                with row_cols[5]:
+                    st.write(law.get('search_query', ''))
 
         direct_selection = [st.session_state.search_results[i] for i in selected_indices]
         if direct_selection:
@@ -2757,13 +3675,21 @@ def display_search_results_and_collect(oc_code: str):
     st.session_state.selected_laws = flattened_selected
 
     if flattened_selected:
-        st.success(f"{len(flattened_selected)}개 법령이 선택되었습니다")
+        st.success(f"{len(flattened_selected)}개 항목이 선택되었습니다")
 
-        selected_admin = sum(1 for law in flattened_selected if law.get('is_admin_rule'))
-        if selected_admin > 0:
-            st.info(f"📋 선택된 행정규칙: {selected_admin}개")
+        # 유형별 통계 표시
+        type_counts = {}
+        for law in flattened_selected:
+            data_type = law.get('data_type', 'law')
+            law_type = law.get('law_type', '기타')
+            key = f"{get_data_type_emoji(law)} {law_type}"
+            type_counts[key] = type_counts.get(key, 0) + 1
 
-        if st.button("📥 선택한 법령 수집", type="primary", use_container_width=True):
+        if len(type_counts) > 1 or (len(type_counts) == 1 and list(type_counts.values())[0] > 0):
+            type_info = ", ".join([f"{k}: {v}개" for k, v in type_counts.items()])
+            st.info(type_info)
+
+        if st.button("📥 선택한 항목 수집", type="primary", use_container_width=True):
             collect_selected_laws(oc_code)
 
 
@@ -3126,8 +4052,8 @@ def main():
     
     # 제목
     st.title("📚 법제처 법령 수집기")
-    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v6.9)")
-    st.markdown("**✨ 개선사항: PDF 다운로드 → OCR 텍스트 추출, 초기화 시 설정 유지**")
+    st.markdown("법제처 Open API를 활용한 법령 수집 도구 (v7.0)")
+    st.markdown("**✨ 신규 기능: 자치법규, 판례, 헌재결정례, 법령해석례, 행정심판례, 조약 검색 지원**")
     
     # 사이드바
     oc_code = show_sidebar()
