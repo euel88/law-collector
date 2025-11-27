@@ -411,7 +411,7 @@ class EnhancedLawFileExtractor:
                 # API 호출 - 안전한 방식으로
                 try:
                     response = client.chat.completions.create(
-                        model="gpt-4.1",
+                        model="gpt-5",
                         messages=[
                             {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                             {"role": "user", "content": prompt}
@@ -429,10 +429,10 @@ class EnhancedLawFileExtractor:
                     return laws.union(ai_laws)
 
                 except Exception as chat_error:
-                    # gpt-4.1이 실패하면 gpt-4o 시도
+                    # gpt-5 실패 시 재시도
                     try:
                         response = client.chat.completions.create(
-                            model="gpt-4o",
+                            model="gpt-5",
                             messages=[
                                 {"role": "system", "content": "한국 법령 전문가. 법령체계도에서 법령명을 정확히 추출하고, 특수문자 변환과 사용자 의도를 파악합니다."},
                                 {"role": "user", "content": prompt}
@@ -442,7 +442,7 @@ class EnhancedLawFileExtractor:
                         )
 
                         ai_laws = self._parse_ai_response_enhanced(response.choices[0].message.content)
-                        self.logger.info(f"GPT-4o로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
+                        self.logger.info(f"GPT-5로 {len(ai_laws - laws)}개의 법령을 추가로 찾았습니다.")
                         return laws.union(ai_laws)
 
                     except:
@@ -2953,7 +2953,7 @@ def show_sidebar():
                                         try:
                                             # 가장 간단한 API 호출 - chat completion
                                             test_response = test_client.chat.completions.create(
-                                                model="gpt-4.1",
+                                                model="gpt-5",
                                                 messages=[{"role": "user", "content": "test"}],
                                                 max_tokens=1
                                             )
@@ -2966,10 +2966,10 @@ def show_sidebar():
                                                 if test_response and hasattr(test_response, 'data'):
                                                     success = True
                                             except:
-                                                # gpt-4o로 재시도
+                                                # gpt-5로 재시도
                                                 try:
                                                     test_response = test_client.chat.completions.create(
-                                                        model="gpt-4o",
+                                                        model="gpt-5",
                                                         messages=[{"role": "user", "content": "test"}],
                                                         max_tokens=1
                                                     )
