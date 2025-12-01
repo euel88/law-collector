@@ -2686,6 +2686,73 @@ class LawCollectorAPI:
                             })
                             hierarchy['all_related_names'].append(name)
 
+    def _extract_law_keywords(self, law_name: str) -> List[str]:
+        """법령명에서 검색 키워드 추출 (행정규칙 검색용)"""
+        keywords = []
+
+        # 법, 시행령, 시행규칙 등 접미사 제거
+        suffixes = ['법', '시행령', '시행규칙', '규정', '규칙', '지침', '고시', '훈령', '예규']
+        base_name = law_name
+        for suffix in suffixes:
+            if base_name.endswith(suffix):
+                base_name = base_name[:-len(suffix)]
+                break
+
+        if base_name:
+            keywords.append(base_name)
+
+        # 띄어쓰기 없는 버전과 있는 버전 모두 시도
+        if ' ' in base_name:
+            keywords.append(base_name.replace(' ', ''))
+
+        return keywords
+
+    def _search_related_admin_rules(self, law_name: str, seen_ids: set) -> List[Dict[str, Any]]:
+        """법령명 키워드로 관련 행정규칙 검색"""
+        results = []
+        keywords = self._extract_law_keywords(law_name)
+
+        self.logger.info(f"행정규칙 키워드 검색: {keywords}")
+
+        for keyword in keywords:
+            if len(keyword) < 2:
+                continue
+
+            try:
+                params = {
+                    'OC': self.oc_code,
+                    'target': 'admrul',
+                    'type': 'XML',
+                    'query': keyword,
+                    'display': '100',
+                    'page': '1'
+                }
+
+                response = self.session.get(
+                    self.config.ADMIN_RULE_SEARCH_URL,
+                    params=params,
+                    timeout=self.config.TIMEOUT
+                )
+
+                if response.status_code == 200:
+                    rules = self._parse_admin_rule_search_response(response.text, keyword)
+
+                    for rule in rules:
+                        rule_id = rule.get('law_id', '')
+                        if rule_id and rule_id not in seen_ids:
+                            # 키워드가 실제로 규칙명에 포함되어 있는지 확인
+                            rule_name = rule.get('law_name', '')
+                            if keyword in rule_name:
+                                seen_ids.add(rule_id)
+                                rule['hierarchy_source'] = f'관련 행정규칙 ({keyword})'
+                                results.append(rule)
+                                self.logger.info(f"관련 행정규칙 발견: {rule_name}")
+
+            except Exception as e:
+                self.logger.error(f"행정규칙 키워드 검색 오류 ({keyword}): {e}")
+
+        return results
+
     def search_with_hierarchy(self, query: str, progress_callback=None) -> Dict[str, Any]:
         """법령 체계도 기반 통합 검색 - 상위법과 모든 하위법령을 함께 검색"""
         result = {
@@ -2769,6 +2836,18 @@ class LawCollectorAPI:
                     seen_ids.add(law['law_id'])
                     law['hierarchy_source'] = law_name
                     collected_laws.append(law)
+
+        # Step 5: 관련 행정규칙 키워드 검색 (법령명에서 키워드 추출하여 검색)
+        if progress_callback:
+            progress_callback(0.92, "관련 행정규칙 검색 중...")
+
+        # 기본 법령명에서 키워드 추출하여 행정규칙 검색
+        main_law_name = hierarchy_detail.get('law_name', query)
+        related_admin_rules = self._search_related_admin_rules(main_law_name, seen_ids)
+
+        if related_admin_rules:
+            self.logger.info(f"관련 행정규칙 {len(related_admin_rules)}개 추가")
+            collected_laws.extend(related_admin_rules)
 
         result['laws'] = collected_laws
 
@@ -3928,8 +4007,8 @@ def handle_direct_search_mode(oc_code: str):
     st.subheader("📂 데이터 유형 선택")
 
     data_type_options = {
-        "법령/행정규칙": "law",
         "📊 법령 체계도 (상하위법 일괄)": "hierarchy",
+        "법령/행정규칙": "law",
         "자치법규": "ordinance",
         "판례": "precedent",
         "헌재결정례": "constitutional",
@@ -3942,7 +4021,7 @@ def handle_direct_search_mode(oc_code: str):
         "검색할 데이터 유형",
         options=list(data_type_options.keys()),
         index=0,
-        help="검색할 법률 데이터 유형을 선택하세요"
+        help="검색할 법률 데이터 유형을 선택하세요 (기본: 법령 체계도 검색)"
     )
 
     selected_data_type = data_type_options[selected_type_label]
