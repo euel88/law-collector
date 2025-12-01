@@ -2470,6 +2470,379 @@ class LawCollectorAPI:
 
         return detail
 
+    # ===== 법령 체계도 검색 메서드 =====
+    def search_law_hierarchy_list(self, query: str) -> List[Dict[str, Any]]:
+        """법령 체계도 목록 검색 (target=lsStmd)"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'lsStmd',
+            'type': 'XML',
+            'query': query,
+            'display': self.config.RESULTS_PER_PAGE
+        }
+
+        try:
+            time.sleep(self.config.DEFAULT_DELAY)
+            response = self.session.get(
+                self.config.LAW_SEARCH_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.error(f"체계도 목록 검색 실패: HTTP {response.status_code}")
+                return []
+
+            return self._parse_hierarchy_list_response(response.text, query)
+
+        except Exception as e:
+            self.logger.error(f"체계도 목록 검색 오류: {e}")
+            return []
+
+    def _parse_hierarchy_list_response(self, content: str, query: str) -> List[Dict[str, Any]]:
+        """법령 체계도 목록 응답 파싱"""
+        results = []
+
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            for item in root.findall('.//law') or root.findall('.//lsStmd'):
+                law_data = {
+                    'law_id': item.findtext('법령ID', '') or item.findtext('.//법령ID', ''),
+                    'law_msn': item.findtext('법령일련번호', '') or item.findtext('.//법령일련번호', ''),
+                    'law_name': item.findtext('법령명', '') or item.findtext('.//법령명', ''),
+                    'law_type': item.findtext('법령구분명', '') or item.findtext('.//법령구분명', ''),
+                    'promulgation_date': item.findtext('공포일자', '') or item.findtext('.//공포일자', ''),
+                    'enforcement_date': item.findtext('시행일자', '') or item.findtext('.//시행일자', ''),
+                    'department': item.findtext('소관부처명', '') or item.findtext('.//소관부처명', ''),
+                    'search_query': query,
+                    'data_type': 'hierarchy'
+                }
+
+                if law_data['law_id'] or law_data['law_msn']:
+                    results.append(law_data)
+
+        except ET.ParseError as e:
+            self.logger.error(f"체계도 목록 XML 파싱 오류: {e}")
+
+        return results
+
+    def get_law_hierarchy_detail(self, law_id: str = '', law_msn: str = '') -> Optional[Dict[str, Any]]:
+        """법령 체계도 본문 조회 (target=lsStmd) - 상하위법 정보 포함"""
+        params = {
+            'OC': self.oc_code,
+            'target': 'lsStmd',
+            'type': 'XML'
+        }
+
+        if law_id:
+            params['ID'] = law_id
+        elif law_msn:
+            params['MST'] = law_msn
+        else:
+            self.logger.error("법령 ID 또는 MST가 필요합니다")
+            return None
+
+        try:
+            time.sleep(self.config.DEFAULT_DELAY)
+            response = self.session.get(
+                self.config.LAW_DETAIL_URL,
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code != 200:
+                self.logger.error(f"체계도 본문 조회 실패: HTTP {response.status_code}")
+                return None
+
+            return self._parse_hierarchy_detail_response(response.text)
+
+        except Exception as e:
+            self.logger.error(f"체계도 본문 조회 오류: {e}")
+            return None
+
+    def _parse_hierarchy_detail_response(self, content: str) -> Optional[Dict[str, Any]]:
+        """법령 체계도 본문 응답 파싱 - 상하위법 구조 추출"""
+        try:
+            content = self._preprocess_xml_content(content)
+            root = ET.fromstring(content.encode('utf-8'))
+
+            hierarchy = {
+                'law_id': '',
+                'law_msn': '',
+                'law_name': '',
+                'law_type': '',
+                'enforcement_date': '',
+                'promulgation_date': '',
+                'related_laws': {
+                    'laws': [],          # 법률
+                    'enforcement_decrees': [],  # 시행령
+                    'enforcement_rules': [],    # 시행규칙
+                    'admin_rules': []    # 행정규칙 (고시, 훈령 등)
+                },
+                'all_related_names': []  # 모든 관련 법령명 리스트
+            }
+
+            # 기본 정보 추출
+            basic_info = root.find('.//기본정보') or root
+            hierarchy['law_id'] = basic_info.findtext('.//법령ID', '') or root.findtext('.//법령ID', '')
+            hierarchy['law_msn'] = basic_info.findtext('.//법령일련번호', '') or root.findtext('.//법령일련번호', '')
+            hierarchy['law_name'] = basic_info.findtext('.//법령명', '') or root.findtext('.//법령명', '')
+            hierarchy['law_type'] = basic_info.findtext('.//법종구분', '') or root.findtext('.//법종구분', '')
+            hierarchy['enforcement_date'] = basic_info.findtext('.//시행일자', '') or root.findtext('.//시행일자', '')
+            hierarchy['promulgation_date'] = basic_info.findtext('.//공포일자', '') or root.findtext('.//공포일자', '')
+
+            # 상하위법 정보 추출
+            hierarchy_section = root.find('.//상하위법') or root
+
+            # 법률 추출
+            for law_elem in hierarchy_section.findall('.//법률') or []:
+                law_info = self._extract_hierarchy_law_info(law_elem, '법률')
+                if law_info:
+                    hierarchy['related_laws']['laws'].append(law_info)
+                    hierarchy['all_related_names'].append(law_info['name'])
+
+            # 시행령 추출
+            for decree_elem in hierarchy_section.findall('.//시행령') or []:
+                decree_info = self._extract_hierarchy_law_info(decree_elem, '시행령')
+                if decree_info:
+                    hierarchy['related_laws']['enforcement_decrees'].append(decree_info)
+                    hierarchy['all_related_names'].append(decree_info['name'])
+
+            # 시행규칙 추출
+            for rule_elem in hierarchy_section.findall('.//시행규칙') or []:
+                rule_info = self._extract_hierarchy_law_info(rule_elem, '시행규칙')
+                if rule_info:
+                    hierarchy['related_laws']['enforcement_rules'].append(rule_info)
+                    hierarchy['all_related_names'].append(rule_info['name'])
+
+            # 행정규칙 추출 (고시, 훈령 등)
+            for admin_type in ['행정규칙', '고시', '훈령', '예규', '기타']:
+                for admin_elem in hierarchy_section.findall(f'.//{admin_type}') or []:
+                    admin_info = self._extract_hierarchy_law_info(admin_elem, admin_type)
+                    if admin_info:
+                        hierarchy['related_laws']['admin_rules'].append(admin_info)
+                        hierarchy['all_related_names'].append(admin_info['name'])
+
+            # 본문에서 추가 법령 정보 추출 (텍스트 파싱)
+            self._extract_additional_hierarchy_laws(root, hierarchy)
+
+            return hierarchy
+
+        except ET.ParseError as e:
+            self.logger.error(f"체계도 본문 XML 파싱 오류: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"체계도 본문 처리 오류: {e}")
+            return None
+
+    def _extract_hierarchy_law_info(self, elem: ET.Element, law_type: str) -> Optional[Dict[str, str]]:
+        """체계도에서 개별 법령 정보 추출"""
+        # 텍스트로 법령명 추출 시도
+        law_name = elem.text.strip() if elem.text else ''
+
+        # 하위 요소에서 법령명 추출 시도
+        if not law_name:
+            law_name = elem.findtext('.//법령명', '') or elem.findtext('.//명칭', '')
+
+        # 속성에서 법령명 추출 시도
+        if not law_name:
+            law_name = elem.get('법령명', '') or elem.get('명칭', '')
+
+        if not law_name:
+            return None
+
+        return {
+            'name': law_name.strip(),
+            'type': law_type,
+            'id': elem.findtext('.//법령ID', '') or elem.get('법령ID', ''),
+            'msn': elem.findtext('.//법령일련번호', '') or elem.get('법령일련번호', ''),
+            'enforcement_date': elem.findtext('.//시행일자', '') or elem.get('시행일자', ''),
+            'promulgation_date': elem.findtext('.//공포일자', '') or elem.get('공포일자', '')
+        }
+
+    def _extract_additional_hierarchy_laws(self, root: ET.Element, hierarchy: Dict[str, Any]):
+        """XML 전체에서 추가 법령 정보 추출"""
+        # 본문에서 행정규칙 정보 추출 (다양한 구조 지원)
+        admin_patterns = ['행정규칙', '하위행정규칙', '관련행정규칙', '위임행정규칙']
+
+        for pattern in admin_patterns:
+            section = root.find(f'.//{pattern}')
+            if section is not None:
+                # 섹션 내의 모든 항목 검색
+                for child in section:
+                    if child.text and child.text.strip():
+                        name = child.text.strip()
+                        if name not in hierarchy['all_related_names']:
+                            tag_name = child.tag if child.tag else '행정규칙'
+                            hierarchy['related_laws']['admin_rules'].append({
+                                'name': name,
+                                'type': tag_name,
+                                'id': child.get('법령ID', '') or child.findtext('.//법령ID', ''),
+                                'msn': child.get('행정규칙일련번호', '') or child.findtext('.//행정규칙일련번호', ''),
+                                'enforcement_date': '',
+                                'promulgation_date': ''
+                            })
+                            hierarchy['all_related_names'].append(name)
+
+    def search_with_hierarchy(self, query: str, progress_callback=None) -> Dict[str, Any]:
+        """법령 체계도 기반 통합 검색 - 상위법과 모든 하위법령을 함께 검색"""
+        result = {
+            'query': query,
+            'hierarchy_info': None,
+            'laws': [],
+            'search_summary': {
+                'total': 0,
+                'laws_count': 0,
+                'decrees_count': 0,
+                'rules_count': 0,
+                'admin_rules_count': 0
+            }
+        }
+
+        # Step 1: 체계도 목록 검색
+        if progress_callback:
+            progress_callback(0.1, "체계도 목록 검색 중...")
+
+        hierarchy_list = self.search_law_hierarchy_list(query)
+
+        if not hierarchy_list:
+            self.logger.warning(f"체계도 검색 결과 없음: {query}")
+            # 일반 법령 검색으로 폴백
+            return self._fallback_to_regular_search(query, progress_callback)
+
+        # Step 2: 체계도 본문 조회 (가장 유사한 결과 사용)
+        if progress_callback:
+            progress_callback(0.2, "체계도 상세 정보 조회 중...")
+
+        target_law = self._find_best_match(hierarchy_list, query)
+        hierarchy_detail = self.get_law_hierarchy_detail(
+            law_id=target_law.get('law_id', ''),
+            law_msn=target_law.get('law_msn', '')
+        )
+
+        if not hierarchy_detail:
+            self.logger.warning("체계도 상세 정보 조회 실패")
+            return self._fallback_to_regular_search(query, progress_callback)
+
+        result['hierarchy_info'] = hierarchy_detail
+
+        # Step 3: 체계도에서 추출한 모든 법령 검색
+        all_law_names = hierarchy_detail.get('all_related_names', [])
+
+        # 기본 법령명도 추가
+        if hierarchy_detail.get('law_name'):
+            if hierarchy_detail['law_name'] not in all_law_names:
+                all_law_names.insert(0, hierarchy_detail['law_name'])
+
+        if not all_law_names:
+            all_law_names = [query]
+
+        self.logger.info(f"체계도에서 {len(all_law_names)}개 법령 발견: {all_law_names}")
+
+        # Step 4: 각 법령 검색 및 상세 정보 수집
+        if progress_callback:
+            progress_callback(0.3, f"{len(all_law_names)}개 법령 검색 중...")
+
+        collected_laws = []
+        seen_ids = set()
+
+        for idx, law_name in enumerate(all_law_names):
+            if progress_callback:
+                progress = 0.3 + (0.6 * (idx + 1) / len(all_law_names))
+                progress_callback(progress, f"검색 중: {law_name}")
+
+            # 법령 검색 (정확한 매칭 사용)
+            search_results = self._search_exact_match(law_name)
+
+            # 결과가 없으면 일반 검색 시도
+            if not search_results:
+                search_results = self._search_general_law(law_name)
+
+            # 행정규칙 검색도 시도
+            if not search_results:
+                search_results = self._search_admin_rule(law_name)
+
+            for law in search_results:
+                if law['law_id'] not in seen_ids:
+                    seen_ids.add(law['law_id'])
+                    law['hierarchy_source'] = law_name
+                    collected_laws.append(law)
+
+        result['laws'] = collected_laws
+
+        # 통계 업데이트
+        result['search_summary']['total'] = len(collected_laws)
+        for law in collected_laws:
+            law_type = law.get('law_type', '')
+            if law.get('is_admin_rule'):
+                result['search_summary']['admin_rules_count'] += 1
+            elif '시행령' in law_type or '시행령' in law.get('law_name', ''):
+                result['search_summary']['decrees_count'] += 1
+            elif '시행규칙' in law_type or '시행규칙' in law.get('law_name', ''):
+                result['search_summary']['rules_count'] += 1
+            else:
+                result['search_summary']['laws_count'] += 1
+
+        if progress_callback:
+            progress_callback(1.0, "검색 완료")
+
+        return result
+
+    def _find_best_match(self, results: List[Dict[str, Any]], query: str) -> Dict[str, Any]:
+        """검색 결과에서 가장 유사한 항목 찾기"""
+        if not results:
+            return {}
+
+        best_match = results[0]
+        best_similarity = 0
+
+        for result in results:
+            law_name = result.get('law_name', '')
+            similarity = self._calculate_similarity(query, law_name)
+
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_match = result
+
+        return best_match
+
+    def _fallback_to_regular_search(self, query: str, progress_callback=None) -> Dict[str, Any]:
+        """체계도 검색 실패 시 일반 검색으로 폴백"""
+        if progress_callback:
+            progress_callback(0.5, "일반 검색으로 전환...")
+
+        result = {
+            'query': query,
+            'hierarchy_info': None,
+            'laws': [],
+            'search_summary': {
+                'total': 0,
+                'laws_count': 0,
+                'decrees_count': 0,
+                'rules_count': 0,
+                'admin_rules_count': 0
+            },
+            'fallback': True
+        }
+
+        # 일반 법령 검색
+        laws = self._search_with_variations(query)
+        result['laws'] = laws
+        result['search_summary']['total'] = len(laws)
+
+        for law in laws:
+            if law.get('is_admin_rule'):
+                result['search_summary']['admin_rules_count'] += 1
+            else:
+                result['search_summary']['laws_count'] += 1
+
+        if progress_callback:
+            progress_callback(1.0, "검색 완료")
+
+        return result
+
     # ===== 통합 검색 메서드 =====
     def search_by_type(self, query: str, data_type: str) -> List[Dict[str, Any]]:
         """데이터 유형별 검색"""
@@ -2852,8 +3225,235 @@ class LawExporter:
                 if law.get('attachments'):
                     content += f"- 별표/별첨: {len(law['attachments'])}개\n"
                 content += "\n"
-            
+
         return content
+
+    def export_merged_pdf_content(self, laws_dict: Dict[str, Dict[str, Any]],
+                                   base_law_name: str = '') -> bytes:
+        """여러 법령을 하나의 통합 파일로 내보내기 (PDF 대체용 Markdown)"""
+        content = self._create_merged_markdown(laws_dict, base_law_name)
+        return content.encode('utf-8')
+
+    def export_merged_markdown(self, laws_dict: Dict[str, Dict[str, Any]],
+                                base_law_name: str = '') -> str:
+        """여러 법령을 하나의 Markdown 파일로 병합"""
+        return self._create_merged_markdown(laws_dict, base_law_name)
+
+    def _create_merged_markdown(self, laws_dict: Dict[str, Dict[str, Any]],
+                                 base_law_name: str = '') -> str:
+        """통합 Markdown 콘텐츠 생성"""
+        lines = []
+
+        # 제목
+        title = f"{base_law_name} 법령 체계도" if base_law_name else "법령 통합 문서"
+        lines.append(f"# 📚 {title}\n")
+        lines.append(f"> 생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        lines.append(f"> 총 법령 수: {len(laws_dict)}개\n")
+
+        # 목차 생성
+        lines.append("\n---\n")
+        lines.append("## 📑 목차\n")
+
+        # 법령을 유형별로 분류
+        law_types = {
+            '법률': [],
+            '시행령': [],
+            '시행규칙': [],
+            '행정규칙': []
+        }
+
+        for law_id, law in laws_dict.items():
+            law_name = law.get('law_name', '')
+            law_type = law.get('law_type', '')
+
+            if law.get('is_admin_rule') or any(k in law_name for k in ['고시', '훈령', '예규', '규정', '세칙']):
+                law_types['행정규칙'].append((law_id, law))
+            elif '시행규칙' in law_name or '시행규칙' in law_type:
+                law_types['시행규칙'].append((law_id, law))
+            elif '시행령' in law_name or '시행령' in law_type:
+                law_types['시행령'].append((law_id, law))
+            else:
+                law_types['법률'].append((law_id, law))
+
+        # 목차 작성
+        toc_num = 1
+        for type_name, type_laws in law_types.items():
+            if type_laws:
+                lines.append(f"\n### {type_name}\n")
+                for law_id, law in type_laws:
+                    # 앵커 링크 생성
+                    anchor = self._sanitize_filename(law['law_name']).replace(' ', '-').lower()
+                    lines.append(f"{toc_num}. [{law['law_name']}](#{anchor})")
+                    toc_num += 1
+
+        lines.append("\n---\n")
+        lines.append("## 📖 법령 본문\n")
+
+        # 각 법령 본문 작성
+        for type_name, type_laws in law_types.items():
+            if type_laws:
+                lines.append(f"\n### 📂 {type_name}\n")
+                lines.append("---\n")
+
+                for law_id, law in type_laws:
+                    lines.append(self._format_law_for_merge(law))
+                    lines.append("\n---\n")
+
+        return '\n'.join(lines)
+
+    def _format_law_for_merge(self, law: Dict[str, Any]) -> str:
+        """병합 문서용 개별 법령 포맷"""
+        lines = []
+
+        # 법령 제목 (앵커 포함)
+        anchor = self._sanitize_filename(law['law_name']).replace(' ', '-').lower()
+        lines.append(f"<a name=\"{anchor}\"></a>")
+        lines.append(f"## 📜 {law['law_name']}\n")
+
+        # 기본 정보 테이블
+        lines.append("| 항목 | 내용 |")
+        lines.append("|------|------|")
+        lines.append(f"| **법종구분** | {law.get('law_type', '-')} |")
+        if law.get('department'):
+            lines.append(f"| **소관부처** | {law.get('department', '-')} |")
+        lines.append(f"| **공포일자** | {law.get('promulgation_date', '-')} |")
+        lines.append(f"| **시행일자** | {law.get('enforcement_date', '-')} |")
+        if law.get('articles'):
+            lines.append(f"| **조문 수** | {len(law['articles'])}개 |")
+        if law.get('attachments'):
+            lines.append(f"| **별표/별첨** | {len(law['attachments'])}개 |")
+
+        lines.append("")
+
+        # 조문
+        if law.get('articles'):
+            lines.append("### 📖 조문\n")
+            for article in law['articles']:
+                lines.append(f"#### {article['number']} {article.get('title', '')}\n")
+                lines.append(f"{article['content']}\n")
+
+                if article.get('paragraphs'):
+                    for para in article['paragraphs']:
+                        lines.append(f"> {para['number']} {para['content']}\n")
+                lines.append("")
+
+        # 부칙
+        if law.get('supplementary_provisions'):
+            lines.append("### 📋 부칙\n")
+            for provision in law['supplementary_provisions']:
+                if provision.get('promulgation_date'):
+                    lines.append(f"#### 부칙 <{provision['promulgation_date']}>\n")
+                lines.append(f"{provision['content']}\n")
+                lines.append("")
+
+        # 별표/별첨
+        if law.get('attachments'):
+            lines.append("### 📎 별표/별첨\n")
+            for attachment in law['attachments']:
+                lines.append(f"#### [{attachment['type']}] {attachment.get('title', '')}\n")
+                if attachment.get('content'):
+                    # 긴 내용은 접기로 처리
+                    content = attachment['content']
+                    if len(content) > 500:
+                        lines.append("<details>")
+                        lines.append("<summary>내용 보기 (클릭하여 펼치기)</summary>\n")
+                        lines.append(f"```\n{content}\n```")
+                        lines.append("</details>\n")
+                    else:
+                        lines.append(f"```\n{content}\n```\n")
+                lines.append("")
+
+        # 원문 (조문이 없는 경우)
+        if not law.get('articles') and law.get('raw_content'):
+            lines.append("### 📄 원문\n")
+            lines.append(f"```\n{law['raw_content']}\n```\n")
+
+        return '\n'.join(lines)
+
+    def export_merged_zip(self, laws_dict: Dict[str, Dict[str, Any]],
+                          base_law_name: str = '') -> bytes:
+        """통합 파일과 개별 파일을 모두 포함하는 ZIP 내보내기"""
+        zip_buffer = BytesIO()
+
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            # 1. 통합 Markdown 파일
+            merged_md = self._create_merged_markdown(laws_dict, base_law_name)
+            safe_base_name = self._sanitize_filename(base_law_name) if base_law_name else '법령_통합'
+            zip_file.writestr(f'{safe_base_name}_통합.md', merged_md)
+
+            # 2. 통합 JSON 파일
+            metadata = {
+                'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'base_law_name': base_law_name,
+                'total_laws': len(laws_dict),
+                'laws': laws_dict
+            }
+            zip_file.writestr(
+                f'{safe_base_name}_통합.json',
+                json.dumps(metadata, ensure_ascii=False, indent=2)
+            )
+
+            # 3. 개별 파일들
+            for law_id, law in laws_dict.items():
+                safe_name = self._sanitize_filename(law['law_name'])
+
+                # 개별 Markdown
+                md_content = self._format_law_markdown(law)
+                zip_file.writestr(f'laws/{safe_name}.md', md_content)
+
+                # 개별 JSON
+                zip_file.writestr(
+                    f'laws/{safe_name}.json',
+                    json.dumps(law, ensure_ascii=False, indent=2)
+                )
+
+            # 4. README
+            readme = self._create_merged_readme(laws_dict, base_law_name)
+            zip_file.writestr('README.md', readme)
+
+        zip_buffer.seek(0)
+        return zip_buffer.getvalue()
+
+    def _create_merged_readme(self, laws_dict: Dict[str, Dict[str, Any]],
+                               base_law_name: str = '') -> str:
+        """통합 내보내기용 README 생성"""
+        lines = []
+
+        lines.append(f"# 📚 {base_law_name or '법령'} 체계도 수집 결과\n")
+        lines.append(f"> 생성일시: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        lines.append("## 📊 수집 통계\n")
+        lines.append(f"- **총 법령 수**: {len(laws_dict)}개")
+
+        # 유형별 통계
+        admin_count = sum(1 for law in laws_dict.values() if law.get('is_admin_rule', False))
+        general_count = len(laws_dict) - admin_count
+        article_count = sum(len(law.get('articles', [])) for law in laws_dict.values())
+        attachment_count = sum(len(law.get('attachments', [])) for law in laws_dict.values())
+
+        lines.append(f"- **일반 법령**: {general_count}개")
+        lines.append(f"- **행정규칙**: {admin_count}개")
+        lines.append(f"- **총 조문 수**: {article_count}개")
+        lines.append(f"- **총 별표/별첨**: {attachment_count}개\n")
+
+        lines.append("## 📁 파일 구조\n")
+        lines.append("```")
+        safe_base_name = self._sanitize_filename(base_law_name) if base_law_name else '법령_통합'
+        lines.append(f"├── {safe_base_name}_통합.md    # 모든 법령을 하나로 통합한 파일")
+        lines.append(f"├── {safe_base_name}_통합.json  # 전체 데이터 (JSON)")
+        lines.append("├── laws/                       # 개별 법령 파일들")
+        lines.append("│   ├── [법령명].md")
+        lines.append("│   └── [법령명].json")
+        lines.append("└── README.md                   # 이 파일")
+        lines.append("```\n")
+
+        lines.append("## 📋 수집된 법령 목록\n")
+
+        for law_id, law in laws_dict.items():
+            law_type_icon = "📋" if law.get('is_admin_rule') else "📖"
+            lines.append(f"- {law_type_icon} **{law['law_name']}** ({law.get('law_type', '')})")
+
+        return '\n'.join(lines)
 
 
 # ===== Streamlit UI 함수들 =====
@@ -3094,6 +3694,232 @@ def test_admin_rule_search(oc_code: str):
             time.sleep(0.5)
 
 
+def handle_hierarchy_search(collector: LawCollectorAPI, query: str):
+    """법령 체계도 검색 처리 - 상하위법 일괄 검색"""
+    st.subheader(f"📊 '{query}' 법령 체계도 검색")
+
+    # 진행 상태 표시
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    def update_progress(progress: float, message: str):
+        progress_bar.progress(progress)
+        status_text.text(message)
+
+    # 체계도 기반 검색 실행
+    hierarchy_result = collector.search_with_hierarchy(query, update_progress)
+
+    # 진행 상태 정리
+    progress_bar.empty()
+    status_text.empty()
+
+    # 결과가 없는 경우
+    if not hierarchy_result.get('laws'):
+        st.warning("검색 결과가 없습니다.")
+        st.info("💡 Tip: 다른 법령명으로 검색해 보세요.")
+        return
+
+    # 폴백 여부 표시
+    if hierarchy_result.get('fallback'):
+        st.info("ℹ️ 체계도 정보가 없어 일반 검색 결과를 표시합니다.")
+
+    # 체계도 정보 표시
+    hierarchy_info = hierarchy_result.get('hierarchy_info')
+    if hierarchy_info:
+        with st.expander("📊 법령 체계도 구조", expanded=True):
+            # 기본 정보
+            st.markdown(f"**기준 법령:** {hierarchy_info.get('law_name', query)}")
+            st.markdown(f"**법종:** {hierarchy_info.get('law_type', '-')}")
+
+            # 관련 법령 구조
+            related = hierarchy_info.get('related_laws', {})
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown("**📜 법률**")
+                laws = related.get('laws', [])
+                if laws:
+                    for law in laws:
+                        st.write(f"  • {law.get('name', '')}")
+                else:
+                    st.write("  (없음)")
+
+                st.markdown("**📋 시행령**")
+                decrees = related.get('enforcement_decrees', [])
+                if decrees:
+                    for decree in decrees:
+                        st.write(f"  • {decree.get('name', '')}")
+                else:
+                    st.write("  (없음)")
+
+            with col2:
+                st.markdown("**📑 시행규칙**")
+                rules = related.get('enforcement_rules', [])
+                if rules:
+                    for rule in rules:
+                        st.write(f"  • {rule.get('name', '')}")
+                else:
+                    st.write("  (없음)")
+
+                st.markdown("**📌 행정규칙 (고시/훈령 등)**")
+                admin_rules = related.get('admin_rules', [])
+                if admin_rules:
+                    for admin in admin_rules:
+                        st.write(f"  • {admin.get('name', '')} [{admin.get('type', '')}]")
+                else:
+                    st.write("  (없음)")
+
+    # 검색 결과 요약
+    summary = hierarchy_result.get('search_summary', {})
+    st.success(f"✅ 총 {summary.get('total', 0)}개의 법령을 찾았습니다!")
+
+    # 통계 표시
+    stats_cols = st.columns(4)
+    with stats_cols[0]:
+        st.metric("법률", summary.get('laws_count', 0))
+    with stats_cols[1]:
+        st.metric("시행령", summary.get('decrees_count', 0))
+    with stats_cols[2]:
+        st.metric("시행규칙", summary.get('rules_count', 0))
+    with stats_cols[3]:
+        st.metric("행정규칙", summary.get('admin_rules_count', 0))
+
+    # 결과를 세션에 저장
+    results = hierarchy_result.get('laws', [])
+    st.session_state.search_results = results
+    st.session_state.current_data_type = 'hierarchy'
+    st.session_state.hierarchy_info = hierarchy_info
+
+    # 결과 목록 표시
+    st.subheader("📋 검색된 법령 목록")
+
+    # 전체 선택 옵션
+    select_all = st.checkbox("전체 선택", value=True, key="hierarchy_select_all")
+
+    # 결과 표시 및 선택
+    selected_laws = []
+
+    # 유형별로 그룹화하여 표시
+    law_groups = {
+        '법률': [],
+        '시행령': [],
+        '시행규칙': [],
+        '행정규칙': []
+    }
+
+    for law in results:
+        law_name = law.get('law_name', '')
+        law_type = law.get('law_type', '')
+
+        if law.get('is_admin_rule') or any(k in law_name for k in ['고시', '훈령', '예규', '규정', '세칙']):
+            law_groups['행정규칙'].append(law)
+        elif '시행규칙' in law_name or '시행규칙' in law_type:
+            law_groups['시행규칙'].append(law)
+        elif '시행령' in law_name or '시행령' in law_type:
+            law_groups['시행령'].append(law)
+        else:
+            law_groups['법률'].append(law)
+
+    # 그룹별로 표시
+    for group_name, group_laws in law_groups.items():
+        if group_laws:
+            with st.expander(f"{group_name} ({len(group_laws)}개)", expanded=True):
+                for idx, law in enumerate(group_laws):
+                    col1, col2, col3 = st.columns([0.5, 5, 2])
+
+                    with col1:
+                        is_selected = st.checkbox(
+                            "",
+                            value=select_all,
+                            key=f"hierarchy_law_{law['law_id']}_{idx}",
+                            label_visibility="collapsed"
+                        )
+                        if is_selected:
+                            selected_laws.append(law)
+
+                    with col2:
+                        st.write(f"**{law.get('law_name', '')}**")
+                        if law.get('hierarchy_source'):
+                            st.caption(f"체계도 출처: {law['hierarchy_source']}")
+
+                    with col3:
+                        law_type = law.get('law_type', '')
+                        if law.get('is_admin_rule'):
+                            st.caption(f"🏛️ 행정규칙 | {law_type}")
+                        else:
+                            st.caption(f"📜 {law_type}")
+
+    # 선택된 법령 저장
+    st.session_state.hierarchy_selected_laws = selected_laws
+
+    # 수집 버튼
+    st.divider()
+
+    if st.button("📥 선택한 법령 상세 정보 수집", type="primary", use_container_width=True):
+        if not selected_laws:
+            st.error("수집할 법령을 선택해주세요!")
+        else:
+            collect_hierarchy_laws(collector, selected_laws)
+
+
+def collect_hierarchy_laws(collector: LawCollectorAPI, laws: List[Dict[str, Any]]):
+    """체계도에서 선택한 법령들의 상세 정보 수집"""
+    st.subheader("📥 법령 상세 정보 수집 중...")
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    collected_details = {}
+    errors = []
+
+    for idx, law in enumerate(laws):
+        progress = (idx + 1) / len(laws)
+        progress_bar.progress(progress)
+        status_text.text(f"수집 중: {law.get('law_name', '')} ({idx + 1}/{len(laws)})")
+
+        try:
+            # 상세 정보 조회
+            detail = collector.get_detail_by_type(law)
+
+            if detail:
+                collected_details[law['law_id']] = detail
+            else:
+                errors.append(law.get('law_name', ''))
+
+        except Exception as e:
+            logger.error(f"법령 수집 오류: {law.get('law_name', '')}: {e}")
+            errors.append(law.get('law_name', ''))
+
+        time.sleep(0.2)  # API 부하 방지
+
+    progress_bar.empty()
+    status_text.empty()
+
+    # 결과 저장
+    st.session_state.collected_laws = collected_details
+
+    # 결과 표시
+    st.success(f"✅ {len(collected_details)}개 법령의 상세 정보를 수집했습니다!")
+
+    if errors:
+        with st.expander(f"⚠️ 수집 실패 ({len(errors)}개)"):
+            for err in errors:
+                st.write(f"- {err}")
+
+    # 통계 표시
+    total_articles = sum(len(d.get('articles', [])) for d in collected_details.values())
+    total_attachments = sum(len(d.get('attachments', [])) for d in collected_details.values())
+
+    stats_cols = st.columns(3)
+    with stats_cols[0]:
+        st.metric("수집 법령", len(collected_details))
+    with stats_cols[1]:
+        st.metric("조문 수", total_articles)
+    with stats_cols[2]:
+        st.metric("별표/별지", total_attachments)
+
+
 def handle_direct_search_mode(oc_code: str):
     """직접 검색 모드 처리"""
     st.header("🔍 직접 검색 모드")
@@ -3103,6 +3929,7 @@ def handle_direct_search_mode(oc_code: str):
 
     data_type_options = {
         "법령/행정규칙": "law",
+        "📊 법령 체계도 (상하위법 일괄)": "hierarchy",
         "자치법규": "ordinance",
         "판례": "precedent",
         "헌재결정례": "constitutional",
@@ -3123,6 +3950,7 @@ def handle_direct_search_mode(oc_code: str):
     # 데이터 유형별 설명
     type_descriptions = {
         "law": "💡 법령/행정규칙 검색: 띄어쓰기 변형을 포함하여 최대한 많은 법령을 찾습니다.",
+        "hierarchy": "📊 법령 체계도 검색: 상위법(법률)을 검색하면 시행령, 시행규칙, 행정규칙(고시, 훈령 등) 등 관련된 모든 하위법령을 함께 검색합니다.",
         "ordinance": "📜 자치법규 검색: 지방자치단체의 조례, 규칙 등을 검색합니다.",
         "precedent": "⚖️ 판례 검색: 대법원 및 하급법원 판례를 검색합니다.",
         "constitutional": "🏛️ 헌재결정례 검색: 헌법재판소의 결정례를 검색합니다.",
@@ -3136,6 +3964,7 @@ def handle_direct_search_mode(oc_code: str):
     # 검색어 입력
     placeholder_texts = {
         "law": "예: 민법, 상법, 금융감독규정",
+        "hierarchy": "예: 금융지주회사법, 자본시장법, 개인정보보호법",
         "ordinance": "예: 주차장, 환경, 청소년",
         "precedent": "예: 손해배상, 계약해제",
         "constitutional": "예: 위헌, 기본권",
@@ -3160,7 +3989,11 @@ def handle_direct_search_mode(oc_code: str):
                 collector = LawCollectorAPI(oc_code)
 
                 # 데이터 유형에 따른 검색
-                if selected_data_type == "law":
+                if selected_data_type == "hierarchy":
+                    # 법령 체계도 검색 (상하위법 일괄 검색)
+                    handle_hierarchy_search(collector, search_query)
+                    return  # 체계도 검색은 별도 처리
+                elif selected_data_type == "law":
                     # 기존 법령/행정규칙 검색 (변형 검색 포함)
                     results = collector._search_with_variations(search_query)
                 else:
@@ -3915,20 +4748,115 @@ def display_download_section():
     """다운로드 섹션 표시 - 모든 형식 지원"""
     if not st.session_state.collected_laws:
         return
-        
+
     st.header("💾 다운로드")
-    
+
     exporter = LawExporter()
-    
+
+    # 체계도 검색 결과인 경우 특별 다운로드 옵션 표시
+    is_hierarchy_search = st.session_state.get('current_data_type') == 'hierarchy'
+    hierarchy_info = st.session_state.get('hierarchy_info')
+
     # 다운로드 옵션
     st.subheader("📥 다운로드 옵션")
-    download_option = st.radio(
-        "다운로드 방식 선택",
-        ["개별 파일 (ZIP)", "통합 파일 (단일)"],
-        help="개별 파일: 각 법령별로 파일 생성\n통합 파일: 모든 법령을 하나의 파일로"
-    )
+
+    if is_hierarchy_search:
+        download_option = st.radio(
+            "다운로드 방식 선택",
+            ["📊 통합 파일 (Merge)", "개별 파일 (ZIP)", "통합 파일 (단일)"],
+            help="통합 파일 (Merge): 모든 법령을 체계도 형식으로 하나의 문서로 병합\n개별 파일: 각 법령별로 파일 생성\n통합 파일 (단일): 기존 단일 파일 형식"
+        )
+    else:
+        download_option = st.radio(
+            "다운로드 방식 선택",
+            ["개별 파일 (ZIP)", "통합 파일 (단일)"],
+            help="개별 파일: 각 법령별로 파일 생성\n통합 파일: 모든 법령을 하나의 파일로"
+        )
     
-    if download_option == "개별 파일 (ZIP)":
+    # Merge 다운로드 (체계도 검색 결과용)
+    if download_option == "📊 통합 파일 (Merge)":
+        st.info("📊 **법령 체계도 통합 다운로드**: 모든 법령을 하나의 문서로 병합합니다.")
+
+        # 기준 법령명 추출
+        base_law_name = ""
+        if hierarchy_info:
+            base_law_name = hierarchy_info.get('law_name', '')
+
+        # 형식 선택
+        merge_format = st.selectbox(
+            "통합 파일 형식",
+            ["Markdown (통합 + 개별 ZIP)", "Markdown 단일 파일", "JSON 단일 파일"],
+            help="Markdown (통합 + 개별 ZIP): 통합 문서와 개별 파일을 모두 포함한 ZIP\nMarkdown 단일: 통합 Markdown 파일만\nJSON 단일: 전체 데이터를 JSON으로"
+        )
+
+        # 통계 표시
+        total_laws = len(st.session_state.collected_laws)
+        total_articles = sum(len(law.get('articles', [])) for law in st.session_state.collected_laws.values())
+        total_attachments = sum(len(law.get('attachments', [])) for law in st.session_state.collected_laws.values())
+
+        st.markdown(f"""
+        **통합 파일 내용:**
+        - 📚 법령 수: {total_laws}개
+        - 📖 조문 수: {total_articles}개
+        - 📎 별표/별첨: {total_attachments}개
+        """)
+
+        if merge_format == "Markdown (통합 + 개별 ZIP)":
+            # 통합 + 개별 ZIP
+            zip_data = exporter.export_merged_zip(st.session_state.collected_laws, base_law_name)
+
+            st.download_button(
+                label="📦 통합 ZIP 다운로드 (Merge + 개별)",
+                data=zip_data,
+                file_name=f"{base_law_name or '법령'}_체계도_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
+                mime="application/zip",
+                use_container_width=True
+            )
+
+        elif merge_format == "Markdown 단일 파일":
+            # Markdown 단일 파일
+            merged_md = exporter.export_merged_markdown(st.session_state.collected_laws, base_law_name)
+
+            # 파일 크기 표시
+            file_size = len(merged_md.encode('utf-8'))
+            st.caption(f"📊 예상 파일 크기: {file_size:,} bytes ({file_size/1024:.1f} KB)")
+
+            st.download_button(
+                label="📄 통합 Markdown 다운로드",
+                data=merged_md,
+                file_name=f"{base_law_name or '법령'}_체계도_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
+
+            # 미리보기
+            with st.expander("📄 내용 미리보기 (처음 2000자)"):
+                st.markdown(merged_md[:2000] + "..." if len(merged_md) > 2000 else merged_md)
+
+        else:  # JSON 단일 파일
+            # JSON 데이터
+            json_data = {
+                'collection_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'base_law_name': base_law_name,
+                'total_laws': total_laws,
+                'hierarchy_info': hierarchy_info,
+                'laws': st.session_state.collected_laws
+            }
+            json_content = json.dumps(json_data, ensure_ascii=False, indent=2)
+
+            # 파일 크기 표시
+            file_size = len(json_content.encode('utf-8'))
+            st.caption(f"📊 예상 파일 크기: {file_size:,} bytes ({file_size/1024:.1f} KB)")
+
+            st.download_button(
+                label="📄 통합 JSON 다운로드",
+                data=json_content,
+                file_name=f"{base_law_name or '법령'}_체계도_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+    elif download_option == "개별 파일 (ZIP)":
         # ZIP 다운로드
         zip_data = exporter.export_to_zip(st.session_state.collected_laws)
         
