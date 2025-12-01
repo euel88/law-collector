@@ -2918,16 +2918,46 @@ class LawCollectorAPI:
                     collected_laws.append(law)
 
         # Step 5: 위임법령 조회 API를 통한 위임 행정규칙 검색
+        # 법률, 시행령, 시행규칙 모두에 대해 위임법령 조회 수행
         if progress_callback:
-            progress_callback(0.85, "위임 법령/행정규칙 검색 중...")
+            progress_callback(0.75, "위임 법령/행정규칙 검색 중...")
 
-        # 기본 법령의 ID로 위임 법령 조회
+        # 수집된 모든 법령의 ID 목록 (법률, 시행령, 시행규칙)
+        law_ids_to_check = []
+
+        # 기본 법령 ID 추가
         main_law_id = hierarchy_detail.get('law_id', '') or target_law.get('law_id', '')
         if main_law_id:
-            delegated_rules = self._search_delegated_rules(main_law_id, seen_ids)
+            law_ids_to_check.append(('기본 법령', main_law_id))
+
+        # 수집된 법령들의 ID 추가 (시행령, 시행규칙 포함)
+        for law in collected_laws:
+            law_id = law.get('law_id', '')
+            law_name = law.get('law_name', '')
+            if law_id and law_id not in [lid for _, lid in law_ids_to_check]:
+                # 행정규칙이 아닌 법령만 추가 (법률, 시행령, 시행규칙)
+                if not law.get('is_admin_rule', False):
+                    law_ids_to_check.append((law_name, law_id))
+
+        self.logger.info(f"위임법령 조회 대상: {len(law_ids_to_check)}개 법령")
+
+        # 각 법령에 대해 위임법령 조회
+        total_delegated = 0
+        for idx, (source_name, law_id) in enumerate(law_ids_to_check):
+            if progress_callback:
+                progress = 0.75 + (0.15 * (idx + 1) / max(len(law_ids_to_check), 1))
+                progress_callback(progress, f"위임법령 조회 중: {source_name[:20]}...")
+
+            delegated_rules = self._search_delegated_rules(law_id, seen_ids)
             if delegated_rules:
-                self.logger.info(f"위임 법령/행정규칙 {len(delegated_rules)}개 추가")
+                self.logger.info(f"{source_name}의 위임 법령/행정규칙 {len(delegated_rules)}개 추가")
+                # 출처 정보 업데이트
+                for rule in delegated_rules:
+                    rule['hierarchy_source'] = f"위임 ({source_name})"
                 collected_laws.extend(delegated_rules)
+                total_delegated += len(delegated_rules)
+
+        self.logger.info(f"총 위임 법령/행정규칙 {total_delegated}개 추가")
 
         # Step 6: 관련 행정규칙 키워드 검색 (법령명에서 키워드 추출하여 검색)
         if progress_callback:
