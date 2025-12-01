@@ -2753,6 +2753,86 @@ class LawCollectorAPI:
 
         return results
 
+    def _get_delegated_admin_rules(self, law_id: str) -> List[str]:
+        """위임법령 조회 API를 통해 위임된 행정규칙 목록 조회"""
+        delegated_rules = []
+
+        if not law_id:
+            return delegated_rules
+
+        try:
+            params = {
+                'OC': self.oc_code,
+                'target': 'lsDelegated',
+                'type': 'XML',
+                'ID': law_id
+            }
+
+            self.logger.info(f"위임법령 조회: ID={law_id}")
+
+            response = self.session.get(
+                'http://www.law.go.kr/DRF/lawService.do',
+                params=params,
+                timeout=self.config.TIMEOUT
+            )
+
+            if response.status_code == 200:
+                content = self._preprocess_xml_content(response.text)
+                root = ET.fromstring(content.encode('utf-8'))
+
+                # 위임행정규칙제목 추출
+                for elem in root.findall('.//위임행정규칙제목'):
+                    if elem.text and elem.text.strip():
+                        rule_name = elem.text.strip()
+                        if rule_name not in delegated_rules:
+                            delegated_rules.append(rule_name)
+                            self.logger.info(f"위임 행정규칙 발견: {rule_name}")
+
+                # 위임법령제목도 추출 (시행령, 시행규칙 등)
+                for elem in root.findall('.//위임법령제목'):
+                    if elem.text and elem.text.strip():
+                        rule_name = elem.text.strip()
+                        if rule_name not in delegated_rules:
+                            delegated_rules.append(rule_name)
+                            self.logger.info(f"위임 법령 발견: {rule_name}")
+
+        except ET.ParseError as e:
+            self.logger.error(f"위임법령 XML 파싱 오류: {e}")
+        except Exception as e:
+            self.logger.error(f"위임법령 조회 오류: {e}")
+
+        return delegated_rules
+
+    def _search_delegated_rules(self, law_id: str, seen_ids: set) -> List[Dict[str, Any]]:
+        """위임된 행정규칙을 검색하여 상세 정보 수집"""
+        results = []
+
+        # 위임된 법령/행정규칙 목록 조회
+        delegated_names = self._get_delegated_admin_rules(law_id)
+
+        self.logger.info(f"위임 법령/행정규칙 {len(delegated_names)}개 발견")
+
+        for rule_name in delegated_names:
+            # 먼저 행정규칙으로 검색
+            search_results = self._search_admin_rule(rule_name)
+
+            # 결과가 없으면 일반 법령으로 검색
+            if not search_results:
+                search_results = self._search_exact_match(rule_name)
+
+            if not search_results:
+                search_results = self._search_general_law(rule_name)
+
+            for rule in search_results:
+                rule_id = rule.get('law_id', '')
+                if rule_id and rule_id not in seen_ids:
+                    seen_ids.add(rule_id)
+                    rule['hierarchy_source'] = f'위임 법령 ({rule_name})'
+                    results.append(rule)
+                    self.logger.info(f"위임 법령 추가: {rule.get('law_name', '')}")
+
+        return results
+
     def search_with_hierarchy(self, query: str, progress_callback=None) -> Dict[str, Any]:
         """법령 체계도 기반 통합 검색 - 상위법과 모든 하위법령을 함께 검색"""
         result = {
@@ -2837,7 +2917,19 @@ class LawCollectorAPI:
                     law['hierarchy_source'] = law_name
                     collected_laws.append(law)
 
-        # Step 5: 관련 행정규칙 키워드 검색 (법령명에서 키워드 추출하여 검색)
+        # Step 5: 위임법령 조회 API를 통한 위임 행정규칙 검색
+        if progress_callback:
+            progress_callback(0.85, "위임 법령/행정규칙 검색 중...")
+
+        # 기본 법령의 ID로 위임 법령 조회
+        main_law_id = hierarchy_detail.get('law_id', '') or target_law.get('law_id', '')
+        if main_law_id:
+            delegated_rules = self._search_delegated_rules(main_law_id, seen_ids)
+            if delegated_rules:
+                self.logger.info(f"위임 법령/행정규칙 {len(delegated_rules)}개 추가")
+                collected_laws.extend(delegated_rules)
+
+        # Step 6: 관련 행정규칙 키워드 검색 (법령명에서 키워드 추출하여 검색)
         if progress_callback:
             progress_callback(0.92, "관련 행정규칙 검색 중...")
 
